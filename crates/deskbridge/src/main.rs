@@ -84,7 +84,7 @@ fn view_command(args: Vec<String>) -> Result<(), PlatformError> {
 fn print_help() {
     eprintln!(
         "\
-deskbridge host [--display N] [--listen addr:port] [--bitrate 20M] [--resolution 1080p] [--inject] [--daemon] [--key \"ssh-ed25519 AAAA...\"]
+deskbridge host [--display N] [--listen addr:port] [--bitrate 20M] [--resolution 1080p] [--inject] [--daemon] [--key \"ssh-ed25519 AAAA...\"] [--github USER]
 deskbridge status
 deskbridge stop
 deskbridge view <addr[:port]> [--code CODE] [--key \"ssh-ed25519 AAAA...\"] [--fingerprint HEX]
@@ -94,6 +94,7 @@ The host prints a pairing code. Ctrl+Alt releases the viewer's pointer grab.
 --daemon keeps the host running after the terminal closes.
 `deskbridge status` prints the pairing code. `deskbridge stop` ends that host.
 --key on the host authorizes an ssh-ed25519 public key. Repeat it for more than one.
+--github USER authorizes the ssh-ed25519 keys published for that GitHub account.
 The host also reads authorized_keys in its state directory.
 The viewer signs with the SSH agent, including 1Password. --key there picks which agent key.
 --code still admits a guest. --resolution is 720p, 1080p, 1440p, 2160p, 4k, or WxH.
@@ -109,6 +110,7 @@ struct HostArgs {
     inject: bool,
     daemon: bool,
     keys: Vec<AuthorizedKey>,
+    github: Vec<String>,
 }
 
 fn host(args: Vec<String>) -> Result<(), PlatformError> {
@@ -150,7 +152,7 @@ fn run_host(args: HostArgs) -> Result<(), PlatformError> {
     ensure_host_permissions(args.inject).map_err(PlatformError::new)?;
     let codecs = require_encode_codec().map_err(PlatformError::new)?;
     let identity = Identity::generate().map_err(PlatformError::new)?;
-    let authorized = authorized_keys(args.keys)?;
+    let authorized = authorized_keys(args.keys, &args.github)?;
     println!("pairing code: {}", identity.code);
     println!("fingerprint:  {}", identity.fingerprint_hex());
     for key in &authorized {
@@ -316,6 +318,7 @@ fn parse_host(args: &[String]) -> Result<HostArgs, PlatformError> {
     let mut inject = false;
     let mut daemon = false;
     let mut keys = Vec::new();
+    let mut github = Vec::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -325,6 +328,10 @@ fn parse_host(args: &[String]) -> Result<HostArgs, PlatformError> {
             "--key" => {
                 let line = take_value(args, &mut index, "--key")?;
                 keys.push(parse_public_key_line(&line).map_err(PlatformError::new)?);
+            }
+            "--github" => {
+                let user = take_value(args, &mut index, "--github")?;
+                github.push(github_username(&user)?.to_string());
             }
             "--display" => {
                 display = take_value(args, &mut index, "--display")?
@@ -356,22 +363,147 @@ fn parse_host(args: &[String]) -> Result<HostArgs, PlatformError> {
         inject,
         daemon,
         keys,
+        github,
     })
 }
 
-#[cfg(target_os = "macos")]
-fn authorized_keys(from_flags: Vec<AuthorizedKey>) -> Result<Vec<AuthorizedKey>, PlatformError> {
-    let mut keys = read_authorized_keys_file()?;
-    for key in from_flags {
+fn github_username(text: &str) -> Result<&str, PlatformError> {
+    let name = text.trim();
+    let bytes = name.as_bytes();
+    let ok = (1..=39).contains(&bytes.len())
+        && bytes.iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        && bytes.first().is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && bytes.last().is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && !name.contains("--");
+    if !ok {
+        return Err(PlatformError::new(format!(
+            "{text} is not a GitHub username"
+        )));
+    }
+    Ok(name)
+}
+
+#[derive(Debug)]
+struct GithubKeySet {
+    keys: Vec<AuthorizedKey>,
+    skipped: u32,
+}
+
+fn keys_from_github_text(user: &str, text: &str) -> Result<GithubKeySet, PlatformError> {
+    let mut keys: Vec<AuthorizedKey> = Vec::new();
+    let mut skipped = 0u32;
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if is_other_ssh_key(line) {
+            skipped += 1;
+            continue;
+        }
+        let mut key = parse_public_key_line(line).map_err(|err| {
+            PlatformError::new(format!("github user {user} key {}: {err}", index + 1))
+        })?;
+        if key.comment.is_empty() {
+            key.comment = format!("github:{user}");
+        }
         if keys.iter().any(|have| have.blob == key.blob) {
             continue;
         }
         keys.push(key);
     }
+    if keys.is_empty() {
+        let message = if skipped == 0 {
+            format!("github user {user} has no public SSH keys")
+        } else {
+            format!("github user {user} has no ssh-ed25519 public keys ({skipped} other keys were skipped)")
+        };
+        return Err(PlatformError::new(message));
+    }
+    Ok(GithubKeySet { keys, skipped })
+}
+
+fn is_other_ssh_key(line: &str) -> bool {
+    line.split_whitespace().any(|token| {
+        (token.starts_with("ssh-") || token.starts_with("ecdsa-") || token.starts_with("sk-"))
+            && token != "ssh-ed25519"
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn authorized_keys(
+    from_flags: Vec<AuthorizedKey>,
+    github_users: &[String],
+) -> Result<Vec<AuthorizedKey>, PlatformError> {
+    let mut keys = read_authorized_keys_file()?;
+    for key in from_flags {
+        push_unique(&mut keys, key);
+    }
+    let mut seen_users = Vec::new();
+    for user in github_users {
+        if seen_users.iter().any(|have: &String| have.eq_ignore_ascii_case(user)) {
+            continue;
+        }
+        seen_users.push(user.clone());
+        let fetched = fetch_github_keys(user)?;
+        if fetched.skipped > 0 {
+            eprintln!(
+                "deskbridge: github user {user} has {} keys that are not ssh-ed25519. Those were skipped.",
+                fetched.skipped
+            );
+        }
+        for key in fetched.keys {
+            push_unique(&mut keys, key);
+        }
+    }
     if keys.len() > 32 {
         return Err(PlatformError::new("at most 32 authorized SSH keys"));
     }
     Ok(keys)
+}
+
+#[cfg(target_os = "macos")]
+fn push_unique(keys: &mut Vec<AuthorizedKey>, key: AuthorizedKey) {
+    if keys.iter().any(|have| have.blob == key.blob) {
+        return;
+    }
+    keys.push(key);
+}
+
+#[cfg(target_os = "macos")]
+fn fetch_github_keys(user: &str) -> Result<GithubKeySet, PlatformError> {
+    use std::io::Read;
+
+    let url = format!("https://github.com/{user}.keys");
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(10))
+        .build();
+    let response = agent.get(&url).set("User-Agent", "deskbridge").call();
+    let response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::Status(404, _)) => {
+            return Err(PlatformError::new(format!("github user {user} was not found")));
+        }
+        Err(ureq::Error::Status(status, _)) => {
+            return Err(PlatformError::new(format!(
+                "github keys for {user} returned HTTP {status}"
+            )));
+        }
+        Err(ureq::Error::Transport(err)) => {
+            return Err(PlatformError::new(format!(
+                "could not reach github for user {user}: {err}"
+            )));
+        }
+    };
+    let mut body = Vec::new();
+    response
+        .into_reader()
+        .take(256 * 1024)
+        .read_to_end(&mut body)
+        .map_err(|err| PlatformError::new(format!("could not read github keys for {user}: {err}")))?;
+    let text = String::from_utf8(body)
+        .map_err(|_| PlatformError::new(format!("github keys for {user} were not utf-8")))?;
+    keys_from_github_text(user, &text)
 }
 
 #[cfg(target_os = "macos")]
@@ -643,6 +775,39 @@ mod tests {
         assert!(!args.inject);
         assert_eq!(args.listen.port(), 9);
         assert!(args.keys.is_empty());
+        assert!(args.github.is_empty());
+    }
+
+    #[test]
+    fn github_usernames_and_account_keys() {
+        let args = parse_host(&["--github".into(), "octocat".into(), "--github".into(), "FiloSottile".into()])
+            .unwrap();
+        assert_eq!(args.github, vec!["octocat".to_string(), "FiloSottile".to_string()]);
+        assert!(parse_host(&["--github".into(), "../etc".into()]).is_err());
+        assert!(parse_host(&["--github".into(), "-bad".into()]).is_err());
+        let text = "\nssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQC comment\nssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBERERERERERERERERERERERERERERERERERERERERER\n";
+        let parsed = keys_from_github_text("octocat", text).unwrap();
+        assert_eq!(parsed.skipped, 1);
+        assert_eq!(parsed.keys.len(), 1);
+        assert_eq!(parsed.keys[0].comment, "github:octocat");
+        match keys_from_github_text("octocat", "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQC comment\n") {
+            Err(err) => assert!(err.to_string().contains("no ssh-ed25519"), "{err}"),
+            Ok(_) => panic!("an rsa-only account was accepted"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn github_fetch_reads_a_real_account() {
+        match fetch_github_keys("torvalds") {
+            Err(err) => assert!(err.to_string().contains("no ssh-ed25519"), "{err}"),
+            Ok(_) => panic!("expected torvalds to have no ssh-ed25519 key"),
+        }
+        match fetch_github_keys("this-user-does-not-exist-deskbridge-zz") {
+            Err(err) => assert!(err.to_string().contains("not found"), "{err}"),
+            Ok(_) => panic!("missing github user was accepted"),
+        }
     }
 
     #[test]

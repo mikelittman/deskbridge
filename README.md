@@ -21,7 +21,7 @@ deskbridge view 100.x.x.x --code CODE
 Click the window to grab the pointer. Ctrl+Alt releases it. UDP port 9787 has to be open between the two machines. If the viewer prints `timed out`, the host is not receiving packets: restart it so the log says it is listening on every interface, and allow incoming connections for the terminal in System Settings if macOS asks.
 
 ```
-deskbridge host [--display N] [--listen addr:port] [--bitrate 20M] [--resolution 1080p] [--inject] [--daemon] [--key "ssh-ed25519 AAAA..."]
+deskbridge host [--display N] [--listen addr:port] [--bitrate 20M] [--resolution 1080p] [--inject] [--daemon] [--key "ssh-ed25519 AAAA..."] [--github USER]
 deskbridge status
 deskbridge stop
 deskbridge view <addr[:port]> [--code CODE] [--key "ssh-ed25519 AAAA..."] [--fingerprint HEX]
@@ -53,11 +53,14 @@ To try it on one Mac, leave `--inject` off and view `127.0.0.1`. Injection is of
 
 The host can admit a viewer that signs a one-time challenge with an `ssh-ed25519` private key. The host keeps only the public key. The private key stays in the SSH agent.
 
-Authorize a key by repeating `--key` with the public-key line, or by putting those lines in `authorized_keys` in the state directory (`~/Library/Application Support/deskbridge/` on macOS):
+Authorize a key by repeating `--key` with the public-key line, by naming a GitHub account, or by putting lines in `authorized_keys` in the state directory (`~/Library/Application Support/deskbridge/` on macOS):
 
 ```
 deskbridge host --daemon --inject --key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... comment"
+deskbridge host --daemon --inject --github yourname
 ```
+
+`--github` reads `https://github.com/yourname.keys` when the host starts and authorizes every `ssh-ed25519` key on that account. Other key types on the account are skipped. Repeat the flag for more than one account. Restart the host after adding a key on GitHub.
 
 On the viewer, Deskbridge asks the agent in `SSH_AUTH_SOCK` and the 1Password agent socket, and signs with the one that holds the matching private key. 1Password prompts before it signs. The host sends the public keys it accepts.
 
@@ -97,4 +100,4 @@ build/package-64.sh
 
 That writes `dist/deskbridge-linux-x86_64` and `dist/deskbridge-windows-x86_64.exe`.
 
-Release binary size: 2.9 MB (3,088,816 bytes) on Apple Silicon.
+Release binary size: 3.6 MB (3,818,096 bytes) on Apple Silicon.

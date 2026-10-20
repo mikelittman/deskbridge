@@ -16,6 +16,7 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-cf = "0.11"
 deskbridge-platform-macos = { path = "../platform-macos" }
+ureq = "2"
 winit = "0.30"
 
 [target.'cfg(target_os = "linux")'.dependencies]
