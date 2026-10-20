@@ -27,11 +27,13 @@ deskbridge stop
 deskbridge view <addr[:port]> [--code CODE] [--key "ssh-ed25519 AAAA..."] [--fingerprint HEX]
 ```
 
-`--bitrate` accepts `20M`, `500k`, or a raw bit count. The default is 20 Mbps.
+`--bitrate` accepts `20M`, `500k`, or a raw bit count. The default is 20 Mbps. The host sends the next frame only as fast as the link and `--bitrate` can carry. The first picture is small, so a slow link shows the desktop quickly, and the full picture follows. A small change stays sharp and goes out often. When a large part of the screen is changing, the frame rate drops so that region keeps its detail and the pointer keeps moving. Input is applied as soon as it arrives.
 
 `--resolution` accepts `720p`, `1080p`, `1440p`, `2160p`, `4k`, or `1280x720`. The host fits the picture inside that box and keeps the display's aspect ratio. A limit larger than the display leaves the picture at the display's own size. The pointer still covers the whole display.
 
-Quitting the host ends the viewer. Ctrl+C on the host closes the session. If the host process is killed, the viewer closes once the connection times out, about 10 seconds.
+The same pairing code admits every viewer until the host process exits. The host keeps listening after a viewer disconnects, in the foreground and as a daemon. Run `deskbridge view` again to reconnect. Several viewers can be connected at once. They share one capture, and each viewer's mouse and keyboard is injected. The cursor drawn on the picture is the cursor on the host Mac. When the last viewer leaves, capture stops until the next connection. Every viewer receives the host's hardware codec, HEVC when this Mac can encode it. A viewer that cannot decode that codec is closed, and the host keeps listening.
+
+Quitting the host, Ctrl+C, or `deskbridge stop` closes every viewer. If the host process is killed, each viewer closes once the connection times out, about 10 seconds.
 
 ## Background host
 
@@ -39,7 +41,7 @@ Quitting the host ends the viewer. Ctrl+C on the host closes the session. If the
 deskbridge host --daemon --inject
 ```
 
-The command prints the pairing code and returns. The host keeps running after the terminal closes. `deskbridge status` prints the code again. `deskbridge stop` ends the host and closes a connected viewer.
+The command prints the pairing code and returns. The host keeps running after the terminal closes, and after a viewer disconnects. `deskbridge status` prints the code again. `deskbridge stop` ends the host and closes every connected viewer.
 
 On macOS the pid, state, and log are in `~/Library/Application Support/deskbridge/`. On Linux they are in `$XDG_STATE_HOME/deskbridge` or `~/.local/state/deskbridge`. On Windows they are in `%LOCALAPPDATA%\deskbridge`. `DESKBRIDGE_STATE_DIR` overrides that directory.
 
@@ -100,4 +102,6 @@ build/package-64.sh
 
 That writes `dist/deskbridge-linux-x86_64` and `dist/deskbridge-windows-x86_64.exe`.
 
-Release binary size: 3.6 MB (3,818,096 bytes) on Apple Silicon.
+Release binary size: 3.7 MB (3,901,488 bytes) on Apple Silicon.
+
+Deskbridge is licensed under the MIT License. See `LICENSE`.

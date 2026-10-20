@@ -24,3 +24,9 @@ deskbridge-platform-linux = { path = "../platform-linux" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 deskbridge-platform-windows = { path = "../platform-windows" }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+deskbridge-platform-macos = { path = "../platform-macos" }
+deskbridge-proto = { path = "../proto" }
+deskbridge-session = { path = "../session" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

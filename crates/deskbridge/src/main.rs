@@ -5,6 +5,8 @@
 compile_error!("Linux and Windows builds are 64-bit only");
 
 #[cfg(target_os = "macos")]
+mod sessions;
+#[cfg(target_os = "macos")]
 mod view;
 mod daemon;
 mod error;
@@ -20,11 +22,9 @@ use deskbridge_session::{mono_us, parse_public_key_line, AuthorizedKey};
 use deskbridge_session::{parse_authorized_file, public_key_line};
 
 #[cfg(target_os = "macos")]
-use deskbridge_platform_macos::{ensure_host_permissions, require_encode_codec, Host, HostOptions, Outbound};
+use deskbridge_platform_macos::{ensure_host_permissions, require_encode_codec};
 #[cfg(target_os = "macos")]
-use deskbridge_proto::{negotiate_codec, Control};
-#[cfg(target_os = "macos")]
-use deskbridge_session::{accept_one, listen, Identity};
+use deskbridge_session::{listen, Identity};
 
 const DEFAULT_PORT: u16 = 9787;
 
@@ -98,7 +98,10 @@ The host prints a pairing code. Ctrl+Alt releases the viewer's pointer grab.
 The host also reads authorized_keys in its state directory.
 The viewer signs with the SSH agent, including 1Password. --key there picks which agent key.
 --code still admits a guest. --resolution is 720p, 1080p, 1440p, 2160p, 4k, or WxH.
-Quitting the host ends the viewer. A killed host ends the viewer after the connection times out."
+The host keeps listening after a viewer disconnects. Several viewers can connect at once.
+The first picture is small so it shows up quickly, then the full picture follows.
+The frame rate drops when a large part of the screen is changing, so input stays responsive.
+Quitting the host, or deskbridge stop, closes every viewer."
     );
 }
 
@@ -189,125 +192,19 @@ fn run_host(args: HostArgs) -> Result<(), PlatformError> {
             .unwrap_or_else(|_| args.listen.to_string());
         files.publish(&identity.code, &identity.fingerprint_hex(), &listen)?;
     }
-    runtime.block_on(async move {
-        let shutdown = shutdown_requested();
-        tokio::pin!(shutdown);
-        let mut paired = loop {
-            tokio::select! {
-                _ = &mut shutdown => {
-                    println!("stopping");
-                    return Ok(());
-                }
-                result = accept_one(&endpoint, &identity, codecs.clone(), &authorized) => {
-                    match result {
-                        Ok(paired) => break paired,
-                        Err(err) if err.to_string().contains("endpoint closed") => {
-                            return Err(PlatformError::new(err));
-                        }
-                        Err(err) => eprintln!("deskbridge: {err}"),
-                    }
-                }
-            }
-        };
-        let codec = negotiate_codec(&codecs, &paired.peer_codecs).ok_or_else(|| {
-            PlatformError::new("the viewer cannot decode H.264 or HEVC from this host")
-        })?;
-        match &paired.viewer {
-            deskbridge_session::ViewerProof::PairingCode => {
-                println!("paired by pairing code, encoding {}", codec.name());
-            }
-            deskbridge_session::ViewerProof::SshKey { comment } if comment.is_empty() => {
-                println!("paired by ssh key, encoding {}", codec.name());
-            }
-            deskbridge_session::ViewerProof::SshKey { comment } => {
-                println!("paired by ssh key ({comment}), encoding {}", codec.name());
-            }
-        }
-        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
-        let capture = Host::spawn(
-            HostOptions {
-                display_index: args.display,
-                bitrate: args.bitrate,
-                inject: args.inject,
-                codec,
-                resolution: args.resolution,
-            },
-            outbound_tx,
-        )
-        .map_err(PlatformError::new)?;
-        loop {
-            tokio::select! {
-                _ = &mut shutdown => {
-                    println!("stopping");
-                    break;
-                }
-                incoming = paired.from_peer.recv() => {
-                    let Some(message) = incoming else { break };
-                    match message {
-                        Control::Input(input) => capture.inject(input),
-                        Control::KeyframeRequest { .. } => capture.request_keyframe(),
-                        _ => {}
-                    }
-                }
-                outgoing = outbound_rx.recv() => {
-                    let Some(outgoing) = outgoing else { break };
-                    match outgoing {
-                        Outbound::Control(message) => paired.send_control(message),
-                        Outbound::Frame(frame) => paired.send_frame(frame),
-                    }
-                }
-            }
-        }
-        drop(capture);
-        paired.shutdown().await;
-        let _ = tokio::time::timeout(Duration::from_millis(500), endpoint.wait_idle()).await;
-        Ok(())
-    })?;
+    let codec = codecs[0];
+    runtime.block_on(sessions::serve(
+        endpoint,
+        identity,
+        codec,
+        authorized,
+        args.display,
+        args.bitrate,
+        args.inject,
+        args.resolution,
+    ));
     drop(session_files);
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-async fn shutdown_requested() {
-    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
-    let mut ctrl_c_ok = true;
-    #[cfg(unix)]
-    let mut terminate = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
-        Ok(signal) => Some(signal),
-        Err(err) => {
-            eprintln!("deskbridge: stop signal is unavailable ({err})");
-            None
-        }
-    };
-    loop {
-        tokio::select! {
-            result = &mut ctrl_c, if ctrl_c_ok => {
-                match result {
-                    Ok(()) => return,
-                    Err(err) => {
-                        eprintln!("deskbridge: ctrl-c is unavailable ({err})");
-                        ctrl_c_ok = false;
-                    }
-                }
-            }
-            _ = async {
-                #[cfg(unix)]
-                {
-                    if let Some(signal) = terminate.as_mut() {
-                        signal.recv().await;
-                        return;
-                    }
-                }
-                std::future::pending::<()>().await
-            } => return,
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                if daemon::is_child() && daemon::stop_requested() {
-                    return;
-                }
-            }
-        }
-    }
 }
 
 fn parse_host(args: &[String]) -> Result<HostArgs, PlatformError> {

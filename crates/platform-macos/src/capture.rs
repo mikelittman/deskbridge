@@ -50,11 +50,16 @@ impl DisplayGeometry {
 pub struct CapturedFrame {
     pub surface: IOSurface,
     pub capture_us: u64,
+    /// Share of the frame that changed, from 0 to 1.
+    /// `None` means ScreenCaptureKit did not say which region moved.
+    pub changed: Option<f32>,
 }
 
 struct Latest {
     frame: Mutex<Option<CapturedFrame>>,
     cv: Condvar,
+    width: u32,
+    height: u32,
 }
 
 pub struct Capture {
@@ -116,6 +121,8 @@ impl Capture {
         let latest = Arc::new(Latest {
             frame: Mutex::new(None),
             cv: Condvar::new(),
+            width: pixel_width,
+            height: pixel_height,
         });
         let slot = Arc::clone(&latest);
         stream
@@ -193,9 +200,21 @@ fn push_sample(slot: &Latest, sample: CMSampleBuffer) {
     let captured = CapturedFrame {
         surface,
         capture_us: mono_us(),
+        changed: changed_fraction(slot, &sample),
     };
     *slot.frame.lock().expect("capture slot") = Some(captured);
     slot.cv.notify_one();
+}
+
+/// `None` from ScreenCaptureKit means the attachment was missing or empty.
+/// Both come back as no rectangles, so the fraction stays unknown.
+fn changed_fraction(slot: &Latest, sample: &CMSampleBuffer) -> Option<f32> {
+    let rects = sample.dirty_rects()?;
+    let sizes: Vec<(f64, f64)> = rects
+        .iter()
+        .map(|rect| (rect.size.width, rect.size.height))
+        .collect();
+    crate::pace::changed_fraction(slot.width, slot.height, Some(&sizes))
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use deskbridge_platform_macos::{hardware_decode_codecs, CursorDraw, Decoder, Renderer};
 
 use crate::error::PlatformError;
-use deskbridge_proto::{CodecConfig, CodecId, Control, CursorPos, Input, MouseButton};
+use deskbridge_proto::{CodecConfig, CodecId, Control, CursorPos, DisplayInfo, Input, MouseButton};
 use deskbridge_session::{
     agent_available, connect, mono_us, parse_fingerprint, parse_public_key_line, ClientAuth, KeyChoice,
     PairedClient,
@@ -65,7 +65,9 @@ pub fn view(args: Vec<String>) -> Result<(), PlatformError> {
         local_cursor: None,
         host_cursor: CursorPos { x: 0, y: 0, visible: false },
         hotspot: (1, 1),
+        display: None,
         config: None,
+        previous_config: None,
         decoder: Decoder::new(),
         picture: None,
         codec: None,
@@ -177,7 +179,9 @@ struct Viewer {
     local_cursor: Option<(i32, i32)>,
     host_cursor: CursorPos,
     hotspot: (i32, i32),
+    display: Option<DisplayInfo>,
     config: Option<CodecConfig>,
+    previous_config: Option<CodecConfig>,
     decoder: Decoder,
     picture: Option<apple_cf::iosurface::IOSurface>,
     codec: Option<CodecId>,
@@ -224,27 +228,17 @@ impl Viewer {
             return true;
         }
         if let Some(frame) = self.client.frames.try_recv() {
-            if let Some(config) = self.config.clone() {
-                match self.decoder.decode(&config, &frame) {
-                    Ok(Some(surface)) => {
-                        self.latency.note_frame(
-                            frame.id,
-                            frame.capture_us,
-                            frame.payload.len() as u32,
-                        );
-                        self.picture = Some(surface);
-                        dirty = true;
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        eprintln!("decode: {err}");
-                        self.client
-                            .send_control(Control::KeyframeRequest { newest_seen: frame.id });
-                    }
-                }
-            } else {
+            if self.config.is_none() {
                 self.client
                     .send_control(Control::KeyframeRequest { newest_seen: frame.id });
+            } else if let Some(surface) = self.decode_frame(&frame) {
+                self.latency.note_frame(
+                    frame.id,
+                    frame.capture_us,
+                    frame.payload.len() as u32,
+                );
+                self.picture = Some(surface);
+                dirty = true;
             }
         }
         if self.latency.due_ping() {
@@ -257,7 +251,18 @@ impl Viewer {
 
     fn apply_control(&mut self, message: Control, dirty: &mut bool) {
         match message {
+            Control::DisplayInfo(info) => {
+                self.display = Some(info);
+            }
             Control::CodecConfig(config) => {
+                let same = self.config.as_ref().is_some_and(|current| {
+                    current.width == config.width
+                        && current.height == config.height
+                        && current.parameter_sets == config.parameter_sets
+                });
+                if !same {
+                    self.previous_config = self.config.clone();
+                }
                 self.codec = Some(config.codec);
                 self.config = Some(config);
             }
@@ -309,9 +314,60 @@ impl Viewer {
         self.pointer = Some((x, y));
         if let Some((px, py)) = self.renderer.map_pointer(x as f32, y as f32) {
             self.local_cursor = Some((px, py));
+            let (x, y) = self.to_display(px, py);
             self.client
-                .send_control(Control::Input(Input::MouseMove { x: px, y: py }));
+                .send_control(Control::Input(Input::MouseMove { x, y }));
             self.dirty = true;
+        }
+    }
+
+    /// The picture may be a small first frame. The host still speaks in capture pixels.
+    fn to_display(&self, x: i32, y: i32) -> (i32, i32) {
+        let Some(display) = &self.display else {
+            return (x, y);
+        };
+        let (width, height) = self.renderer.frame_size();
+        if width <= 1 || height <= 1 {
+            return (x, y);
+        }
+        (
+            scale_axis(x, width, display.width),
+            scale_axis(y, height, display.height),
+        )
+    }
+
+    fn to_texture(&self, x: i32, y: i32) -> (i32, i32) {
+        let Some(display) = &self.display else {
+            return (x, y);
+        };
+        let (width, height) = self.renderer.frame_size();
+        if width <= 1 || height <= 1 || display.width == 0 || display.height == 0 {
+            return (x, y);
+        }
+        (
+            scale_axis(x, display.width, width),
+            scale_axis(y, display.height, height),
+        )
+    }
+
+    /// Decode with the current codec config. A frame that belongs to the previous
+    /// picture still decodes, so the full-frame config cannot blank the first picture.
+    fn decode_frame(&mut self, frame: &deskbridge_proto::VideoFrame) -> Option<apple_cf::iosurface::IOSurface> {
+        let config = self.config.clone()?;
+        match self.decoder.decode(&config, frame) {
+            Ok(Some(surface)) => return Some(surface),
+            Ok(None) => return None,
+            Err(err) => {
+                if let Some(previous) = self.previous_config.clone() {
+                    if let Ok(Some(surface)) = self.decoder.decode(&previous, frame) {
+                        return Some(surface);
+                    }
+                }
+                eprintln!("decode: {err}");
+                self.client
+                    .send_control(Control::KeyframeRequest { newest_seen: frame.id });
+                None
+            }
         }
     }
 
@@ -324,9 +380,10 @@ impl Viewer {
                 hotspot_y: self.hotspot.1,
             })
         } else if self.host_cursor.visible {
+            let (x, y) = self.to_texture(self.host_cursor.x, self.host_cursor.y);
             Some(CursorDraw {
-                x: self.host_cursor.x,
-                y: self.host_cursor.y,
+                x,
+                y,
                 hotspot_x: self.hotspot.0,
                 hotspot_y: self.hotspot.1,
             })
@@ -468,6 +525,7 @@ impl ApplicationHandler for Viewer {
         }
         if let Some(reason) = self.ended.clone() {
             println!("{}", session_end_line(&reason));
+            println!("Run deskbridge view again to reconnect.");
             self.announced = true;
             event_loop.exit();
             return;
@@ -504,6 +562,21 @@ mod tests {
             "host ended the session (closed by peer: closed (code 0))"
         );
     }
+
+    #[test]
+    fn a_small_picture_maps_onto_the_full_display() {
+        assert_eq!(super::scale_axis(320, 640, 5120), 2560);
+        assert_eq!(super::scale_axis(180, 360, 2880), 1440);
+        assert_eq!(super::scale_axis(2560, 5120, 640), 320);
+        assert_eq!(super::scale_axis(10, 640, 640), 10);
+    }
+}
+
+pub(crate) fn scale_axis(value: i32, from: u32, to: u32) -> i32 {
+    if from == 0 || from == to {
+        return value;
+    }
+    (i64::from(value).saturating_mul(i64::from(to)) / i64::from(from)) as i32
 }
 
 fn mouse_button(button: winit::event::MouseButton) -> Option<MouseButton> {

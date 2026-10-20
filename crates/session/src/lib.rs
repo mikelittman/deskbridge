@@ -1,8 +1,9 @@
 //! QUIC session for one Deskbridge host and one viewer.
 //!
-//! Video rides one unidirectional stream per frame. A newer frame resets the
-//! stream still in flight, so a loss or a stall never blocks the next picture.
-//! Keyboard, mouse, cursor, and codec setup ride one reliable bidirectional stream.
+//! Video rides one unidirectional stream per frame. Each frame is written to
+//! completion, in order, and the next one waits until that frame has arrived.
+//! Keyboard, mouse, cursor, and codec setup ride one reliable bidirectional
+//! stream and are sent ahead of video.
 
 mod agent;
 mod identity;
@@ -10,17 +11,19 @@ mod sshkey;
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use deskbridge_proto::{CodecId, Control, Framer, VideoFrame, PROTOCOL_VERSION};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt};
+pub use quinn::Endpoint;
+use quinn::{ClientConfig, Connection, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 
 pub use agent::agent_available;
 pub use identity::{codes_match, hex, parse_fingerprint, Identity};
@@ -76,6 +79,30 @@ impl std::fmt::Display for SessionError {
 impl std::error::Error for SessionError {}
 
 const RESET_NEWER_FRAME: VarInt = VarInt::from_u32(1);
+const CONTROL_PRIORITY: i32 = 16;
+const VIDEO_PRIORITY: i32 = 0;
+const VIDEO_QUEUE: usize = 8;
+
+/// Counts one queued frame until that frame has been written or dropped.
+struct Ticket(Arc<AtomicUsize>);
+
+impl Ticket {
+    fn take(backlog: &Arc<AtomicUsize>) -> Self {
+        backlog.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(backlog))
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct QueuedFrame {
+    frame: VideoFrame,
+    ticket: Option<Ticket>,
+}
 
 /// How the viewer proved it may take the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +117,8 @@ pub struct PairedHost {
     pub viewer: ViewerProof,
     pub from_peer: mpsc::UnboundedReceiver<Control>,
     to_peer: mpsc::UnboundedSender<Control>,
-    video_tx: watch::Sender<Option<VideoFrame>>,
+    video_tx: mpsc::Sender<QueuedFrame>,
+    backlog: Mutex<Option<Arc<AtomicUsize>>>,
     conn: Connection,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -100,9 +128,29 @@ impl PairedHost {
         let _ = self.to_peer.send(message);
     }
 
-    /// Publish a frame. A frame still on the wire is abandoned.
+    /// Queue a frame. The sender writes it to completion before the next one.
+    ///
+    /// Returns false when this viewer's queue is full. The frame is not sent,
+    /// and the caller should request a keyframe so the viewer can resync.
+    pub fn offer_frame(&self, frame: VideoFrame) -> bool {
+        let ticket = self.backlog.lock().ok().and_then(|slot| {
+            slot.as_ref().map(|backlog| Ticket::take(backlog))
+        });
+        self.video_tx
+            .try_send(QueuedFrame { frame, ticket })
+            .is_ok()
+    }
+
+    /// Queue a frame. A full queue drops this frame.
     pub fn send_frame(&self, frame: VideoFrame) {
-        let _ = self.video_tx.send(Some(frame));
+        let _ = self.offer_frame(frame);
+    }
+
+    /// Frames queued here increment `backlog` until they are written or dropped.
+    pub fn share_backlog(&self, backlog: Arc<AtomicUsize>) {
+        if let Ok(mut slot) = self.backlog.lock() {
+            *slot = Some(backlog);
+        }
     }
 
     /// Tell the viewer this session is over, and wait briefly so the close can leave.
@@ -111,6 +159,15 @@ impl PairedHost {
     pub async fn shutdown(self) {
         self.conn.close(VarInt::from_u32(0), b"closed");
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    /// Move the inbound control channel out so another task can read it.
+    ///
+    /// `send_control` and `send_frame` stay on this value. The replacement
+    /// receiver is already closed.
+    pub fn take_inbound(&mut self) -> mpsc::UnboundedReceiver<Control> {
+        let (_closed, rx) = mpsc::unbounded_channel();
+        std::mem::replace(&mut self.from_peer, rx)
     }
 }
 
@@ -205,7 +262,10 @@ fn transport() -> Arc<TransportConfig> {
     transport.max_concurrent_bidi_streams(VarInt::from_u32(8));
     transport.stream_receive_window(VarInt::from_u32(8 * 1024 * 1024));
     transport.receive_window(VarInt::from_u32(16 * 1024 * 1024));
-    transport.send_window(16 * 1024 * 1024);
+    // About 200 ms at 20 Mbps, so video cannot queue seconds ahead of input.
+    transport.send_window(512 * 1024);
+    // Finish one video stream before sharing the link with the next frame.
+    transport.send_fairness(false);
     transport.keep_alive_interval(Some(Duration::from_secs(2)));
     transport.max_idle_timeout(Some(Duration::from_secs(10).try_into().expect("idle timeout")));
     Arc::new(transport)
@@ -218,6 +278,11 @@ pub fn listen(addr: SocketAddr, identity: &Identity) -> Result<Endpoint, Session
     let mut server = ServerConfig::with_crypto(Arc::new(quic));
     server.transport_config(transport());
     Endpoint::server(server, addr).map_err(SessionError::new)
+}
+
+/// Stop accepting and close every connection on this endpoint.
+pub fn close_endpoint(endpoint: &Endpoint) {
+    endpoint.close(VarInt::from_u32(0), b"stopped");
 }
 
 /// What the viewer uses to prove itself. An SSH key signs the host's nonce.
@@ -308,6 +373,7 @@ pub async fn accept_one(
         from_peer: link.from_peer,
         to_peer: link.to_peer,
         video_tx: link.video_tx,
+        backlog: Mutex::new(None),
         conn: link.conn,
         tasks: link.tasks,
     })
@@ -493,7 +559,7 @@ struct LinkParts {
     from_peer: mpsc::UnboundedReceiver<Control>,
     to_peer: mpsc::UnboundedSender<Control>,
     frames: FrameInbox,
-    video_tx: watch::Sender<Option<VideoFrame>>,
+    video_tx: mpsc::Sender<QueuedFrame>,
     conn: Connection,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -511,10 +577,11 @@ fn spawn_link(
     let (from_peer_tx, from_peer) = mpsc::unbounded_channel::<Control>();
     let frames = FrameInbox::new();
     let frame_tx = frames.clone();
-    let (video_tx, mut video_rx) = watch::channel(None::<VideoFrame>);
+    let (video_tx, mut video_rx) = mpsc::channel::<QueuedFrame>(VIDEO_QUEUE);
 
     let writer = tokio::spawn(async move {
         let mut send = send;
+        let _ = send.set_priority(CONTROL_PRIORITY);
         while let Some(message) = outbound.recv().await {
             if write_control(&mut send, &message).await.is_err() {
                 break;
@@ -549,23 +616,19 @@ fn spawn_link(
 
     let video_conn = conn.clone();
     let video = tokio::spawn(async move {
-        let mut inflight: Option<tokio::task::JoinHandle<()>> = None;
-        loop {
-            if video_rx.changed().await.is_err() {
+        while let Some(QueuedFrame { frame, ticket }) = video_rx.recv().await {
+            let _ticket = ticket;
+            let Ok(mut stream) = video_conn.open_uni().await else {
                 break;
+            };
+            let _ = stream.set_priority(VIDEO_PRIORITY);
+            if write_frame(&mut stream, &frame).await.is_err() {
+                let _ = stream.reset(RESET_NEWER_FRAME);
+            } else {
+                // Hold this frame's slot until the viewer has the bytes, so the
+                // next picture cannot crowd it off a slow link.
+                let _ = stream.stopped().await;
             }
-            let frame = video_rx.borrow_and_update().clone();
-            let Some(frame) = frame else { continue };
-            if let Some(task) = inflight.take() {
-                task.abort();
-            }
-            let conn = video_conn.clone();
-            inflight = Some(tokio::spawn(async move {
-                let Ok(mut stream) = conn.open_uni().await else { return };
-                if write_frame(&mut stream, &frame).await.is_err() {
-                    let _ = stream.reset(RESET_NEWER_FRAME);
-                }
-            }));
         }
     });
 
@@ -906,6 +969,144 @@ mod tests {
         connect(addr, &auth, None, vec![CodecId::H264]).await.unwrap();
         let host = host_task.await.unwrap().unwrap();
         assert!(matches!(host.viewer, ViewerProof::PairingCode));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_host_accepts_another_viewer_after_the_first_disconnects() {
+        let identity = Identity::generate().unwrap();
+        let endpoint = listen("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let code = identity.code.clone();
+        let host_task = tokio::spawn(async move {
+            let mut first = accept_one(&endpoint, &identity, vec![CodecId::H264], &[])
+                .await
+                .unwrap();
+            let left = tokio::time::timeout(Duration::from_secs(3), async {
+                while first.from_peer.recv().await.is_some() {}
+            })
+            .await;
+            assert!(left.is_ok(), "first viewer did not disconnect");
+            drop(first);
+            accept_one(&endpoint, &identity, vec![CodecId::H264], &[])
+                .await
+                .unwrap()
+        });
+
+        let first = connect(
+            addr,
+            &ClientAuth { code: Some(code.clone()), keys: KeyChoice::PairingCodeOnly },
+            None,
+            vec![CodecId::H264],
+        )
+        .await
+        .unwrap();
+        drop(first);
+
+        let second = connect(
+            addr,
+            &ClientAuth { code: Some(code), keys: KeyChoice::PairingCodeOnly },
+            None,
+            vec![CodecId::H264],
+        )
+        .await
+        .unwrap();
+        let host = host_task.await.unwrap();
+        host.send_frame(VideoFrame {
+            id: 1,
+            keyframe: true,
+            codec: CodecId::H264,
+            capture_us: 1,
+            encode_us: 1,
+            payload: b"again".to_vec(),
+        });
+        let frame = second.frames.recv_timeout(Duration::from_secs(3)).expect("frame");
+        assert_eq!(frame.payload, b"again");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_viewers_receive_a_frame_at_the_same_time() {
+        let identity = Identity::generate().unwrap();
+        let endpoint = listen("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let code = identity.code.clone();
+        let host_task = tokio::spawn(async move {
+            let first = accept_one(&endpoint, &identity, vec![CodecId::H264], &[])
+                .await
+                .unwrap();
+            let second = accept_one(&endpoint, &identity, vec![CodecId::H264], &[])
+                .await
+                .unwrap();
+            (first, second)
+        });
+
+        let client_a = connect(
+            addr,
+            &ClientAuth { code: Some(code.clone()), keys: KeyChoice::PairingCodeOnly },
+            None,
+            vec![CodecId::H264],
+        )
+        .await
+        .unwrap();
+        let client_b = connect(
+            addr,
+            &ClientAuth { code: Some(code), keys: KeyChoice::PairingCodeOnly },
+            None,
+            vec![CodecId::H264],
+        )
+        .await
+        .unwrap();
+        let clients = [client_a, client_b];
+        let (host_a, host_b) = host_task.await.unwrap();
+        let frame = VideoFrame {
+            id: 7,
+            keyframe: true,
+            codec: CodecId::H264,
+            capture_us: 4,
+            encode_us: 8,
+            payload: b"shared".to_vec(),
+        };
+        host_a.send_frame(frame.clone());
+        host_b.send_frame(frame);
+        for client in &clients {
+            let got = client.frames.recv_timeout(Duration::from_secs(3)).expect("frame");
+            assert_eq!(got.id, 7);
+            assert_eq!(got.payload, b"shared");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frames_arrive_in_order_and_input_still_arrives() {
+        let identity = Identity::generate().unwrap();
+        let endpoint = listen("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let code = identity.code.clone();
+        let host_task = tokio::spawn(async move {
+            accept_one(&endpoint, &identity, vec![CodecId::H264], &[]).await
+        });
+        let auth = ClientAuth {
+            code: Some(code),
+            keys: KeyChoice::PairingCodeOnly,
+        };
+        let client = connect(addr, &auth, None, vec![CodecId::H264]).await.unwrap();
+        let mut host = host_task.await.unwrap().unwrap();
+
+        for id in 1..=3 {
+            host.send_frame(VideoFrame {
+                id,
+                keyframe: id == 1,
+                codec: CodecId::H264,
+                capture_us: id,
+                encode_us: 1,
+                payload: id.to_string().into_bytes(),
+            });
+            let frame = client.frames.recv_timeout(Duration::from_secs(3)).expect("frame");
+            assert_eq!(frame.id, id);
+            assert_eq!(frame.payload, id.to_string().into_bytes());
+        }
+
+        client.send_control(Control::Input(Input::MouseMove { x: 8, y: 9 }));
+        let input = wait_control(&mut host.from_peer).await;
+        assert_eq!(input, Control::Input(Input::MouseMove { x: 8, y: 9 }));
     }
 
     async fn wait_control(rx: &mut mpsc::UnboundedReceiver<Control>) -> Control {

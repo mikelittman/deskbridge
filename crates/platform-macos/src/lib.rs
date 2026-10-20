@@ -2,6 +2,7 @@
 
 mod capture;
 mod cg;
+mod pace;
 mod codec;
 mod cursor;
 mod decode;
@@ -11,6 +12,7 @@ mod host;
 mod input;
 mod permissions;
 mod present;
+mod preview;
 
 pub use capture::{Capture, DisplayGeometry};
 pub use codec::{hardware_decode_codecs, hardware_encode_codecs, require_encode_codec};
@@ -54,6 +56,7 @@ mod tests {
         }
         let mut encoder = encode::Encoder::open(codec, width as u32, height as u32, 8_000_000, 60)
             .expect("encoder");
+        assert!(encoder.set_target_fps(15), "expected frame rate");
         let mut decoder = Decoder::new();
         let mut saved = None;
         let mut picture = None;

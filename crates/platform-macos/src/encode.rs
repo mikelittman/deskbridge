@@ -5,11 +5,17 @@ use deskbridge_session::mono_us;
 use videotoolbox::compression::{
     CompressionSession, FrameProperties, HardwareAcceleration,
 };
-use videotoolbox::ffi::kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder;
+use videotoolbox::ffi::{
+    kCFAllocatorDefault, kCFNumberFloat64Type, kVTCompressionPropertyKey_ExpectedFrameRate,
+    kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, CFNumberCreate, CFRelease,
+};
 use videotoolbox::VTError;
 
 use crate::codec::vt_codec;
 use crate::error::PlatformError;
+use crate::pace::encode_fps;
+
+const MAX_KEYFRAME_INTERVAL: i32 = 3600;
 
 pub struct EncodedPacket {
     pub frame: VideoFrame,
@@ -21,7 +27,9 @@ pub struct Encoder {
     codec: CodecId,
     width: u32,
     height: u32,
+    /// Timescale for frame timestamps. Stays at the capture rate.
     fps: u32,
+    target_fps: u32,
     next_id: u64,
     parameter_sets: Vec<Vec<u8>>,
     nal_length_size: u8,
@@ -44,14 +52,42 @@ impl Encoder {
             width,
             height,
             fps,
+            target_fps: encode_fps(fps, None),
             next_id: 1,
             parameter_sets: Vec::new(),
             nal_length_size: 4,
         })
     }
 
-    pub fn codec(&self) -> CodecId {
-        self.codec
+    /// Tell the encoder how many frames per second we intend to send.
+    /// Bits per frame follow this rate. An unchanged value does nothing.
+    pub fn set_target_fps(&mut self, fps: u32) -> bool {
+        let fps = fps.clamp(1, 60);
+        if fps == self.target_fps {
+            return true;
+        }
+        let value = f64::from(fps);
+        let number = unsafe {
+            CFNumberCreate(
+                kCFAllocatorDefault,
+                kCFNumberFloat64Type,
+                std::ptr::from_ref(&value).cast(),
+            )
+        };
+        if number.is_null() {
+            return false;
+        }
+        let result = unsafe {
+            self.session
+                .set_property(kVTCompressionPropertyKey_ExpectedFrameRate, number.cast())
+        };
+        unsafe { CFRelease(number.cast()) };
+        if result.is_ok() {
+            self.target_fps = fps;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn encode(
@@ -125,8 +161,8 @@ fn open_session(
             .with_allow_frame_reordering(false)
             .with_hardware_acceleration(HardwareAcceleration::Required)
             .with_average_bit_rate(bitrate)
-            .with_expected_frame_rate(f64::from(fps))
-            .with_max_keyframe_interval(fps as i32);
+            .with_expected_frame_rate(f64::from(encode_fps(fps, None)))
+            .with_max_keyframe_interval(MAX_KEYFRAME_INTERVAL);
         if low_latency {
             builder = builder.with_low_latency_rate_control(true);
         }
