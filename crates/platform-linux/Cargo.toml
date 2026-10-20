@@ -1,0 +1,9 @@
+[package]
+name = "deskbridge-platform-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Deskbridge Linux host and viewer backend"
+
+[dependencies]

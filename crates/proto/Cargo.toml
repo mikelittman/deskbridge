@@ -1,0 +1,9 @@
+[package]
+name = "deskbridge-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Deskbridge wire protocol"
+
+[dependencies]

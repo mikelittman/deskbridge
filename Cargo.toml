@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/proto",
+    "crates/session",
+    "crates/platform-macos",
+    "crates/platform-linux",
+    "crates/platform-windows",
+    "crates/deskbridge",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
