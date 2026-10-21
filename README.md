@@ -45,7 +45,27 @@ xcrun notarytool store-credentials deskbridge
 build/sign-macos.sh
 ```
 
-That signs `target/release/deskbridge` as `com.deskbridge`. Screen Recording stays attached to that identity across later builds. Copy the signed file with `scp`. A browser or AirDrop download into `~/Downloads` is quarantined by macOS; `scp` onto a normal path is not.
+That signs `target/release/deskbridge` as `com.deskbridge`. Screen Recording stays attached to that identity across later builds. The release workflow signs and notarizes the macOS binary the same way. Add these repository secrets before the first release:
+
+| Secret | Contents |
+| --- | --- |
+| `APPLE_CERTIFICATE_BASE64` | Developer ID Application certificate and private key, exported as a `.p12` and base64-encoded |
+| `APPLE_CERTIFICATE_PASSWORD` | Password for that `.p12` |
+| `APPLE_API_KEY` | App Store Connect API private key (`.p8` file contents) |
+| `APPLE_API_KEY_ID` | Key ID for that API key |
+| `APPLE_API_ISSUER` | Issuer ID for that API key |
+
+Export the certificate from Keychain Access as a `.p12`, then:
+
+```sh
+base64 -i Certificates.p12 | gh secret set APPLE_CERTIFICATE_BASE64
+gh secret set APPLE_CERTIFICATE_PASSWORD
+gh secret set APPLE_API_KEY < AuthKey_XXXX.p8
+gh secret set APPLE_API_KEY_ID
+gh secret set APPLE_API_ISSUER
+```
+
+Do not commit the `.p12` or the `.p8`. Copy a signed build with `scp`. A browser or AirDrop download into `~/Downloads` is quarantined by macOS; `scp` onto a normal path is not.
 
 64-bit Linux and Windows binaries, on a machine with Docker:
 

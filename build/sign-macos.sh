@@ -40,18 +40,33 @@ codesign --force --options runtime --timestamp \
 codesign --verify --strict --verbose=2 "$bin"
 codesign -dv --verbose=2 "$bin" 2>&1 | head -12
 
-if ! xcrun notarytool history --keychain-profile "$profile" >/dev/null 2>&1; then
-  echo "signed. notarization profile '$profile' is not available."
-  echo "one time: xcrun notarytool store-credentials $profile"
-  exit 0
-fi
-
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 zip="$work/deskbridge.zip"
 ditto -c -k --keepParent "$bin" "$zip"
 echo "submitting for notarization"
-xcrun notarytool submit "$zip" --keychain-profile "$profile" --wait
+if [ -n "${APPLE_API_KEY:-}" ]; then
+  if [ -z "${APPLE_API_KEY_ID:-}" ] || [ -z "${APPLE_API_ISSUER:-}" ]; then
+    echo "APPLE_API_KEY_ID and APPLE_API_ISSUER are required with APPLE_API_KEY" >&2
+    exit 1
+  fi
+  keyfile="$work/AuthKey.p8"
+  printf '%s\n' "$APPLE_API_KEY" > "$keyfile"
+  xcrun notarytool submit "$zip" \
+    --key "$keyfile" \
+    --key-id "$APPLE_API_KEY_ID" \
+    --issuer "$APPLE_API_ISSUER" \
+    --wait
+elif xcrun notarytool history --keychain-profile "$profile" >/dev/null 2>&1; then
+  xcrun notarytool submit "$zip" --keychain-profile "$profile" --wait
+elif [ "${DESKBRIDGE_REQUIRE_NOTARIZATION:-}" = 1 ]; then
+  echo "notarization credentials are missing" >&2
+  exit 1
+else
+  echo "signed. notarization profile '$profile' is not available."
+  echo "one time: xcrun notarytool store-credentials $profile"
+  exit 0
+fi
 # stapler only embeds tickets in bundles, disk images, and packages.
 # A notarized command-line tool is checked online, the same way other CLIs are.
 echo "notarized: $bin"

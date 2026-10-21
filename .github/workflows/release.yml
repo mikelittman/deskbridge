@@ -47,6 +47,15 @@ jobs:
       - name: Build
         shell: bash
         run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Sign and notarize
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: build/ci-sign-macos.sh "target/${{ matrix.target }}/release/deskbridge"
       - name: Collect binary
         shell: bash
         run: |
