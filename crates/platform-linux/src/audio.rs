@@ -4,7 +4,7 @@
 //! ALSA device opened through libasound, so a missing sound card only logs.
 
 use std::collections::VecDeque;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -249,7 +249,7 @@ fn buffered_samples(rate: u32, ms: u32) -> usize {
 struct AlsaOut {
     lib: Option<libloading::Library>,
     pcm: *mut c_void,
-    open: Option<unsafe extern "C" fn(*mut *mut c_void, *const i8, i32, i32) -> i32>,
+    open: Option<unsafe extern "C" fn(*mut *mut c_void, *const c_char, i32, i32) -> i32>,
     set_params: Option<unsafe extern "C" fn(*mut c_void, i32, i32, u32, u32, i32, u32) -> i32>,
     writei: Option<unsafe extern "C" fn(*mut c_void, *const c_void, u64) -> i64>,
     prepare: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
