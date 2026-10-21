@@ -113,6 +113,9 @@ impl Capture {
         let config = SCStreamConfiguration::new()
             .with_width(pixel_width)
             .with_height(pixel_height)
+            // Without this, ScreenCaptureKit keeps the display's full pixel size
+            // and the viewer's resolution never reaches the encoder.
+            .with_scales_to_fit(true)
             .with_pixel_format(PixelFormat::BGRA)
             .with_shows_cursor(false)
             .with_queue_depth(3)
@@ -219,11 +222,33 @@ fn changed_fraction(slot: &Latest, sample: &CMSampleBuffer) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::fit_capture_size;
+    use super::{fit_capture_size, Capture};
+    use std::time::Duration;
 
     #[test]
     fn a_limit_above_native_does_not_scale_up() {
         assert_eq!(fit_capture_size(1800, 1168, 3840, 2160), (1800, 1168));
+    }
+
+    #[test]
+    fn a_resolution_limit_scales_the_captured_frame() {
+        let capture = match Capture::start(0, Some((1280, 720))) {
+            Ok(capture) => capture,
+            Err(err) => {
+                eprintln!("skipping live capture check: {err}");
+                return;
+            }
+        };
+        let frame = capture.wait_frame(Duration::from_secs(2));
+        capture.stop();
+        let frame = frame.expect("a frame");
+        let width = frame.surface.width();
+        let height = frame.surface.height();
+        assert!(
+            width <= 1280 && height <= 720,
+            "captured {width}x{height}, wanted at most 1280x720"
+        );
+        assert!(width >= 2 && height >= 2, "{width}x{height}");
     }
 
     #[test]

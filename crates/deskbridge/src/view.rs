@@ -42,11 +42,15 @@ pub fn view(args: Vec<String>) -> Result<(), PlatformError> {
         .enable_all()
         .build()
         .map_err(PlatformError::new)?;
+    if let Some((width, height)) = args.resolution {
+        println!("requesting a picture of at most {width}x{height}");
+    }
     let client = runtime.block_on(connect_first(
         &args.addrs,
         &auth,
         args.fingerprint,
         hardware_decode_codecs(),
+        args.resolution,
     ))?;
     println!(
         "paired with {}",
@@ -85,6 +89,7 @@ struct ViewArgs {
     code: Option<String>,
     key: Option<String>,
     fingerprint: Option<[u8; 32]>,
+    resolution: Option<(u32, u32)>,
 }
 
 async fn connect_first(
@@ -92,11 +97,12 @@ async fn connect_first(
     auth: &ClientAuth,
     fingerprint: Option<[u8; 32]>,
     codecs: Vec<deskbridge_proto::CodecId>,
+    resolution: Option<(u32, u32)>,
 ) -> Result<PairedClient, PlatformError> {
     let mut failures = Vec::new();
     for addr in addrs {
         println!("connecting to {addr}");
-        match connect(*addr, auth, fingerprint, codecs.clone()).await {
+        match connect(*addr, auth, fingerprint, codecs.clone(), resolution).await {
             Ok(client) => return Ok(client),
             Err(err) if err.is_fatal() => return Err(PlatformError::new(err)),
             Err(err) => {
@@ -116,6 +122,7 @@ fn parse_view(args: &[String]) -> Result<ViewArgs, PlatformError> {
     let mut code = None;
     let mut key = None;
     let mut fingerprint = None;
+    let mut resolution = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -145,6 +152,13 @@ fn parse_view(args: &[String]) -> Result<ViewArgs, PlatformError> {
                     .ok_or_else(|| PlatformError::new("--fingerprint needs 64 hex characters"))?;
                 fingerprint = Some(parse_fingerprint(text).map_err(PlatformError::new)?);
             }
+            "--resolution" => {
+                index += 1;
+                resolution = Some(crate::parse_resolution(
+                    args.get(index)
+                        .ok_or_else(|| PlatformError::new("--resolution needs a value"))?,
+                )?);
+            }
             "--bitrate" => {
                 index += 1;
                 let _ = parse_bitrate(
@@ -164,6 +178,7 @@ fn parse_view(args: &[String]) -> Result<ViewArgs, PlatformError> {
         code,
         key,
         fingerprint,
+        resolution,
     })
 }
 
@@ -552,6 +567,13 @@ mod tests {
         assert_eq!(args.key.as_deref(), Some(line));
         assert!(args.code.is_none());
         assert!(parse_view(&["127.0.0.1".into(), "--key".into(), line.into(), "--key".into(), line.into()]).is_err());
+    }
+
+    #[test]
+    fn view_takes_a_resolution() {
+        let args = parse_view(&["127.0.0.1".into(), "--resolution".into(), "720p".into()]).unwrap();
+        assert_eq!(args.resolution, Some((1280, 720)));
+        assert!(parse_view(&["127.0.0.1".into(), "--resolution".into()]).is_err());
     }
 
     #[test]

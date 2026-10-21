@@ -19,7 +19,7 @@ pub use codec::{hardware_decode_codecs, hardware_encode_codecs, require_encode_c
 pub use decode::Decoder;
 pub use error::PlatformError;
 pub use host::{Host, HostOptions, Outbound};
-pub use permissions::ensure_host_permissions;
+pub use permissions::{ensure_host_permissions, PermissionSubject};
 pub use present::{content_pixel, letterbox, CursorDraw, Letterbox, Renderer};
 
 #[cfg(test)]

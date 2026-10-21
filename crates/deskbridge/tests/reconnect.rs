@@ -142,6 +142,7 @@ async fn connect_viewer(code: &str) -> PairedClient {
         },
         None,
         hardware_decode_codecs(),
+        None,
     )
     .await
     .unwrap_or_else(|err| panic!("connect failed: {err}"))

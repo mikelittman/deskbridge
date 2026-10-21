@@ -22,7 +22,7 @@ use deskbridge_session::{mono_us, parse_public_key_line, AuthorizedKey};
 use deskbridge_session::{parse_authorized_file, public_key_line};
 
 #[cfg(target_os = "macos")]
-use deskbridge_platform_macos::{ensure_host_permissions, require_encode_codec};
+use deskbridge_platform_macos::{ensure_host_permissions, require_encode_codec, PermissionSubject};
 #[cfg(target_os = "macos")]
 use deskbridge_session::{listen, Identity};
 
@@ -87,17 +87,20 @@ fn print_help() {
 deskbridge host [--display N] [--listen addr:port] [--bitrate 20M] [--resolution 1080p] [--inject] [--daemon] [--key \"ssh-ed25519 AAAA...\"] [--github USER]
 deskbridge status
 deskbridge stop
-deskbridge view <addr[:port]> [--code CODE] [--key \"ssh-ed25519 AAAA...\"] [--fingerprint HEX]
+deskbridge view <addr[:port]> [--code CODE] [--key \"ssh-ed25519 AAAA...\"] [--fingerprint HEX] [--resolution 1080p]
 
 Direct connection only. Default port is {DEFAULT_PORT}. The host listens on every interface.
 The host prints a pairing code. Ctrl+Alt releases the viewer's pointer grab.
 --daemon keeps the host running after the terminal closes.
+From SSH, --daemon starts the host in the desktop session so Screen Recording applies to deskbridge. Log in on the Mac's screen first.
 `deskbridge status` prints the pairing code. `deskbridge stop` ends that host.
 --key on the host authorizes an ssh-ed25519 public key. Repeat it for more than one.
 --github USER authorizes the ssh-ed25519 keys published for that GitHub account.
 The host also reads authorized_keys in its state directory.
 The viewer signs with the SSH agent, including 1Password. --key there picks which agent key.
 --code still admits a guest. --resolution is 720p, 1080p, 1440p, 2160p, 4k, or WxH.
+On the viewer, --resolution selects that viewer's picture size. On the host, it is the largest picture the host will send.
+With several viewers, the picture fits the smallest request.
 The host keeps listening after a viewer disconnects. Several viewers can connect at once.
 The first picture is small so it shows up quickly, then the full picture follows.
 The frame rate drops when a large part of the screen is changing, so input stays responsive.
@@ -121,7 +124,11 @@ fn host(args: Vec<String>) -> Result<(), PlatformError> {
     #[cfg(target_os = "macos")]
     {
         if args.daemon && !daemon::is_child() {
-            ensure_host_permissions(args.inject).map_err(PlatformError::new)?;
+            // An SSH parent must not prompt. macOS would attach the grant to sshd.
+            if !daemon::needs_gui_launch() {
+                ensure_host_permissions(args.inject, PermissionSubject::Terminal)
+                    .map_err(PlatformError::new)?;
+            }
             return daemon::spawn();
         }
         return run_host(args);
@@ -152,7 +159,12 @@ fn run_host(args: HostArgs) -> Result<(), PlatformError> {
     } else {
         None
     };
-    ensure_host_permissions(args.inject).map_err(PlatformError::new)?;
+    let subject = if std::env::var_os("DESKBRIDGE_LAUNCHD").is_some() {
+        PermissionSubject::ThisBinary
+    } else {
+        PermissionSubject::Terminal
+    };
+    ensure_host_permissions(args.inject, subject).map_err(PlatformError::new)?;
     let codecs = require_encode_codec().map_err(PlatformError::new)?;
     let identity = Identity::generate().map_err(PlatformError::new)?;
     let authorized = authorized_keys(args.keys, &args.github)?;

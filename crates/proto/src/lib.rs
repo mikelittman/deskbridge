@@ -87,6 +87,8 @@ pub struct Hello {
     /// Codecs this peer can decode.
     pub codecs: Vec<CodecId>,
     pub name: String,
+    /// Largest picture this viewer wants, in pixels. Absent means the host's own limit.
+    pub resolution: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,6 +368,10 @@ impl Control {
                 w.u8(hello.version);
                 w.codecs(&hello.codecs)?;
                 w.str(&hello.name)?;
+                if let Some((width, height)) = hello.resolution {
+                    w.u32(width);
+                    w.u32(height);
+                }
                 MsgType::Hello
             }
             Self::HelloAck(ack) => {
@@ -491,11 +497,24 @@ impl Control {
     fn decode_payload(kind: MsgType, payload: &[u8]) -> Result<Self, ProtoError> {
         let mut r = R::new(payload);
         let msg = match kind {
-            MsgType::Hello => Self::Hello(Hello {
-                version: r.u8()?,
-                codecs: r.codecs()?,
-                name: r.string(256)?,
-            }),
+            MsgType::Hello => {
+                let version = r.u8()?;
+                let codecs = r.codecs()?;
+                let name = r.string(256)?;
+                let resolution = if r.rest() >= 8 {
+                    let width = r.u32()?;
+                    let height = r.u32()?;
+                    (width >= 2 && height >= 2).then_some((width, height))
+                } else {
+                    None
+                };
+                Self::Hello(Hello {
+                    version,
+                    codecs,
+                    name,
+                    resolution,
+                })
+            }
             MsgType::HelloAck => {
                 let version = r.u8()?;
                 let codecs = r.codecs()?;
@@ -709,6 +728,13 @@ mod tests {
             version: 1,
             codecs: vec![CodecId::Hevc, CodecId::H264],
             name: "view".into(),
+            resolution: None,
+        }));
+        roundtrip(Control::Hello(Hello {
+            version: 1,
+            codecs: vec![CodecId::H264],
+            name: "view".into(),
+            resolution: Some((1280, 720)),
         }));
         let mut fingerprint = [0u8; 32];
         fingerprint[0] = 0xab;

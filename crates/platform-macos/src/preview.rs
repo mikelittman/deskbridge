@@ -68,6 +68,34 @@ impl Preview {
     }
 }
 
+/// Scales a captured frame down to the size the viewer asked for.
+pub struct FrameFit {
+    transfer: PixelTransferSession,
+    surface: IOSurface,
+}
+
+impl FrameFit {
+    pub fn open(width: u32, height: u32) -> Result<Self, PlatformError> {
+        let transfer = PixelTransferSession::new().map_err(PlatformError::new)?;
+        let _ = transfer.set_real_time(true);
+        let _ = transfer.set_scaling_mode(ScalingMode::Normal);
+        let surface = IOSurface::create(width as usize, height as usize, BGRA, 4)
+            .ok_or_else(|| PlatformError::new("scaled capture surface"))?;
+        Ok(Self { transfer, surface })
+    }
+
+    pub fn apply<'a>(&'a mut self, source: &IOSurface) -> Result<&'a IOSurface, PlatformError> {
+        let src = CVPixelBuffer::create_with_io_surface(source)
+            .map_err(|code| PlatformError::new(format!("scale source ({code})")))?;
+        let dst = CVPixelBuffer::create_with_io_surface(&self.surface)
+            .map_err(|code| PlatformError::new(format!("scale destination ({code})")))?;
+        self.transfer
+            .transfer(&src, &dst)
+            .map_err(PlatformError::new)?;
+        Ok(&self.surface)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

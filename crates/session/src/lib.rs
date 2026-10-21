@@ -115,6 +115,8 @@ pub enum ViewerProof {
 pub struct PairedHost {
     pub peer_codecs: Vec<CodecId>,
     pub viewer: ViewerProof,
+    /// Largest picture this viewer asked for.
+    pub resolution: Option<(u32, u32)>,
     pub from_peer: mpsc::UnboundedReceiver<Control>,
     to_peer: mpsc::UnboundedSender<Control>,
     video_tx: mpsc::Sender<QueuedFrame>,
@@ -370,6 +372,7 @@ pub async fn accept_one(
     Ok(PairedHost {
         viewer,
         peer_codecs: link.peer_codecs,
+        resolution: hello.resolution,
         from_peer: link.from_peer,
         to_peer: link.to_peer,
         video_tx: link.video_tx,
@@ -393,6 +396,7 @@ pub async fn connect(
     auth: &ClientAuth,
     expected_fingerprint: Option<[u8; 32]>,
     client_codecs: Vec<CodecId>,
+    resolution: Option<(u32, u32)>,
 ) -> Result<PairedClient, SessionError> {
     identity::install_crypto_provider();
     let seen = Arc::new(std::sync::Mutex::new(None));
@@ -435,6 +439,7 @@ pub async fn connect(
             version: PROTOCOL_VERSION,
             codecs: client_codecs,
             name: "deskbridge".into(),
+            resolution,
         }),
     )
     .await?;
@@ -806,7 +811,7 @@ mod tests {
             code: Some(code),
             keys: KeyChoice::PairingCodeOnly,
         };
-        let mut client = connect(addr, &auth, Some(fingerprint), vec![CodecId::Hevc, CodecId::H264])
+        let mut client = connect(addr, &auth, Some(fingerprint), vec![CodecId::Hevc, CodecId::H264], None)
             .await
             .unwrap();
         let mut host = host_task.await.unwrap().unwrap();
@@ -877,7 +882,7 @@ mod tests {
             code: Some("WRONGCODE".into()),
             keys: KeyChoice::PairingCodeOnly,
         };
-        match connect(addr, &auth, None, vec![CodecId::H264]).await {
+        match connect(addr, &auth, None, vec![CodecId::H264], None).await {
             Err(err) => assert!(
                 err.to_string().contains("rejected") || err.to_string().contains("closed"),
                 "{err}"
@@ -911,7 +916,7 @@ mod tests {
                 sign: Box::new(move |payload| Ok(key.sign(payload))),
             }),
         };
-        let client = connect(addr, &auth, None, vec![CodecId::H264]).await.unwrap();
+        let client = connect(addr, &auth, None, vec![CodecId::H264], None).await.unwrap();
         let host = host_task.await.unwrap().unwrap();
         assert_eq!(
             host.viewer,
@@ -938,7 +943,7 @@ mod tests {
                 sign: Box::new(move |payload| Ok(other.sign(payload))),
             }),
         };
-        match connect(addr, &auth, None, vec![CodecId::H264]).await {
+        match connect(addr, &auth, None, vec![CodecId::H264], None).await {
             Err(err) => assert!(err.is_fatal() && err.to_string().contains("rejected"), "{err}"),
             Ok(_) => panic!("a key the host does not hold was accepted"),
         }
@@ -966,9 +971,31 @@ mod tests {
             code: Some(code),
             keys: KeyChoice::PairingCodeOnly,
         };
-        connect(addr, &auth, None, vec![CodecId::H264]).await.unwrap();
+        connect(addr, &auth, None, vec![CodecId::H264], None).await.unwrap();
         let host = host_task.await.unwrap().unwrap();
         assert!(matches!(host.viewer, ViewerProof::PairingCode));
+        assert_eq!(host.resolution, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_viewer_tells_the_host_its_resolution() {
+        let identity = Identity::generate().unwrap();
+        let endpoint = listen("127.0.0.1:0".parse().unwrap(), &identity).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let code = identity.code.clone();
+        let host_task = tokio::spawn(async move {
+            accept_one(&endpoint, &identity, vec![CodecId::H264], &[]).await
+        });
+        let auth = ClientAuth {
+            code: Some(code),
+            keys: KeyChoice::PairingCodeOnly,
+        };
+        let client = connect(addr, &auth, None, vec![CodecId::H264], Some((1280, 720)))
+            .await
+            .unwrap();
+        let host = host_task.await.unwrap().unwrap();
+        assert_eq!(host.resolution, Some((1280, 720)));
+        drop(client);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -997,6 +1024,7 @@ mod tests {
             &ClientAuth { code: Some(code.clone()), keys: KeyChoice::PairingCodeOnly },
             None,
             vec![CodecId::H264],
+            None,
         )
         .await
         .unwrap();
@@ -1007,6 +1035,7 @@ mod tests {
             &ClientAuth { code: Some(code), keys: KeyChoice::PairingCodeOnly },
             None,
             vec![CodecId::H264],
+            None,
         )
         .await
         .unwrap();
@@ -1044,6 +1073,7 @@ mod tests {
             &ClientAuth { code: Some(code.clone()), keys: KeyChoice::PairingCodeOnly },
             None,
             vec![CodecId::H264],
+            None,
         )
         .await
         .unwrap();
@@ -1052,6 +1082,7 @@ mod tests {
             &ClientAuth { code: Some(code), keys: KeyChoice::PairingCodeOnly },
             None,
             vec![CodecId::H264],
+            None,
         )
         .await
         .unwrap();
@@ -1087,7 +1118,7 @@ mod tests {
             code: Some(code),
             keys: KeyChoice::PairingCodeOnly,
         };
-        let client = connect(addr, &auth, None, vec![CodecId::H264]).await.unwrap();
+        let client = connect(addr, &auth, None, vec![CodecId::H264], None).await.unwrap();
         let mut host = host_task.await.unwrap().unwrap();
 
         for id in 1..=3 {

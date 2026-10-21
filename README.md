@@ -1,107 +1,182 @@
 # Deskbridge
 
-A small remote desktop. Phase 1 is a macOS host and a macOS viewer in one binary. The picture is hardware HEVC when this Mac has an encoder, and hardware H.264 otherwise. A still screen sends no video. The cursor is a sprite, not part of the picture.
+Deskbridge is a small remote desktop. One binary is both the host and the viewer. The host captures a Mac screen, encodes it with hardware HEVC when the Mac has that encoder and hardware H.264 otherwise, and sends the picture over a direct UDP connection. You connect with an IP address, a hostname, or a VPN you already run, such as Tailscale or WireGuard.
 
-Connections are direct: an IP address, a hostname, or a VPN you already have (Tailscale, WireGuard). There is no relay and no NAT traversal.
+A still screen sends nothing. When the picture is moving, the host spends the bitrate on the part of the screen that is changing and slows the frame rate when a large area is in motion, so the pointer stays responsive. The cursor is drawn as a sprite on top of the picture.
 
-## Run
+## Features
 
-On the machine you want to watch:
+- macOS host and macOS viewer in one binary, about 4 MB
+- Hardware HEVC, with hardware H.264 when HEVC is unavailable
+- Direct connection on UDP port 9787. No account server and no relay
+- Pairing code, or SSH keys from an agent (including 1Password) and from a GitHub account
+- Several viewers at once, sharing one capture
+- The host keeps listening after a viewer disconnects
+- Optional background host (`--daemon`)
+- Viewer-selected picture size (`--resolution`)
 
+Audio, clipboard sync, file transfer, and multiple monitors are not in this version.
+
+## Requirements
+
+- macOS on both machines. The host is the Mac whose screen you want to see.
+- A Rust toolchain (`rustup`, stable) to build from source.
+- Screen Recording permission on the host. `--inject` also needs Accessibility, so the viewer’s mouse and keyboard can drive the host.
+- UDP port 9787 reachable from the viewer to the host.
+
+Linux and Windows builds of the binary exist for the command-line tools. Capture and the viewer window are macOS-only.
+
+## Build
+
+```sh
+cargo build --release
 ```
+
+The binary is `target/release/deskbridge`. Release builds use thin LTO and strip symbols.
+
+```sh
+cargo test
+```
+
+To sign and notarize a copy you will move to another Mac, install a Developer ID Application certificate, store notary credentials once, and run the sign script:
+
+```sh
+xcrun notarytool store-credentials deskbridge
+build/sign-macos.sh
+```
+
+That signs `target/release/deskbridge` as `com.deskbridge`. Screen Recording stays attached to that identity across later builds. Copy the signed file with `scp`. A browser or AirDrop download into `~/Downloads` is quarantined by macOS; `scp` onto a normal path is not.
+
+64-bit Linux and Windows binaries, on a machine with Docker:
+
+```sh
+build/package-64.sh
+```
+
+Outputs:
+
+- `dist/deskbridge-linux-x86_64`
+- `dist/deskbridge-windows-x86_64.exe`
+
+## Quick start
+
+On the Mac you want to watch:
+
+```sh
 deskbridge host --inject
 ```
 
-The host listens on every interface, port 9787, and prints a pairing code. On the machine you are sitting at, use the host's LAN or Tailscale address:
+The host listens on every interface, port 9787, and prints a pairing code. On the machine you are sitting at, use the host’s LAN or Tailscale address:
 
-```
+```sh
 deskbridge view 100.x.x.x --code CODE
 ```
 
-Click the window to grab the pointer. Ctrl+Alt releases it. UDP port 9787 has to be open between the two machines. If the viewer prints `timed out`, the host is not receiving packets: restart it so the log says it is listening on every interface, and allow incoming connections for the terminal in System Settings if macOS asks.
+Click the window to grab the pointer. Ctrl+Alt releases it.
 
-```
+To try both sides on one Mac, leave `--inject` off and view `127.0.0.1`, so the viewer’s pointer cannot drive the same machine.
+
+## Usage
+
+```text
 deskbridge host [--display N] [--listen addr:port] [--bitrate 20M] [--resolution 1080p] [--inject] [--daemon] [--key "ssh-ed25519 AAAA..."] [--github USER]
+deskbridge view <addr[:port]> [--code CODE] [--key "ssh-ed25519 AAAA..."] [--fingerprint HEX] [--resolution 1080p]
 deskbridge status
 deskbridge stop
-deskbridge view <addr[:port]> [--code CODE] [--key "ssh-ed25519 AAAA..."] [--fingerprint HEX]
 ```
 
-`--bitrate` accepts `20M`, `500k`, or a raw bit count. The default is 20 Mbps. The host sends the next frame only as fast as the link and `--bitrate` can carry. The first picture is small, so a slow link shows the desktop quickly, and the full picture follows. A small change stays sharp and goes out often. When a large part of the screen is changing, the frame rate drops so that region keeps its detail and the pointer keeps moving. Input is applied as soon as it arrives.
+### Picture size and bitrate
 
-`--resolution` accepts `720p`, `1080p`, `1440p`, `2160p`, `4k`, or `1280x720`. The host fits the picture inside that box and keeps the display's aspect ratio. A limit larger than the display leaves the picture at the display's own size. The pointer still covers the whole display.
+`--bitrate` accepts `20M`, `500k`, or a raw bit count. The default is 20 Mbps. The host sends the next frame only as fast as the link and that budget can carry. The first picture is small so a slow link shows the desktop quickly. The full picture follows. A small change stays sharp. A large change lowers the frame rate so that region keeps its detail.
 
-The same pairing code admits every viewer until the host process exits. The host keeps listening after a viewer disconnects, in the foreground and as a daemon. Run `deskbridge view` again to reconnect. Several viewers can be connected at once. They share one capture, and each viewer's mouse and keyboard is injected. The cursor drawn on the picture is the cursor on the host Mac. When the last viewer leaves, capture stops until the next connection. Every viewer receives the host's hardware codec, HEVC when this Mac can encode it. A viewer that cannot decode that codec is closed, and the host keeps listening.
+`--resolution` accepts `720p`, `1080p`, `1440p`, `2160p`, `4k`, or `1280x720`. On the viewer it is the picture size that viewer wants, often the client screen:
 
-Quitting the host, Ctrl+C, or `deskbridge stop` closes every viewer. If the host process is killed, each viewer closes once the connection times out, about 10 seconds.
-
-## Background host
-
+```sh
+deskbridge view 100.x.x.x --resolution 1728x1117
 ```
+
+On the host it is the largest picture the host will send. The host fits the display inside that box and keeps the aspect ratio. A request larger than the host display stays at the display’s own size. The pointer still covers the whole host display. With several viewers, the picture fits the smallest request and grows again when that viewer leaves.
+
+The pixel size of the client Mac is the `Resolution:` line from:
+
+```sh
+system_profiler SPDisplaysDataType | awk '/Resolution:/ {print}'
+```
+
+### Several viewers
+
+The pairing code stays the same until the host process exits. The host keeps listening after a viewer disconnects. Run `deskbridge view` again to reconnect. Viewers share one capture. Each viewer’s mouse and keyboard is injected when `--inject` is on. The cursor on the picture is the host Mac’s cursor. When the last viewer leaves, capture stops until the next connection.
+
+Quitting the host, Ctrl+C, or `deskbridge stop` closes every viewer. If the host process is killed, each viewer closes after the connection times out, about 10 seconds.
+
+### Background host
+
+```sh
 deskbridge host --daemon --inject
 ```
 
-The command prints the pairing code and returns. The host keeps running after the terminal closes, and after a viewer disconnects. `deskbridge status` prints the code again. `deskbridge stop` ends the host and closes every connected viewer.
+The command prints the pairing code and returns. The host keeps running after the terminal closes. `deskbridge status` prints the code again. `deskbridge stop` ends the host and closes every viewer.
 
-On macOS the pid, state, and log are in `~/Library/Application Support/deskbridge/`. On Linux they are in `$XDG_STATE_HOME/deskbridge` or `~/.local/state/deskbridge`. On Windows they are in `%LOCALAPPDATA%\deskbridge`. `DESKBRIDGE_STATE_DIR` overrides that directory.
+From an SSH session, `--daemon` starts the host in the Mac’s desktop session, so Screen Recording applies to the `deskbridge` program. Log in on the Mac’s screen first. The permission prompt appears there.
 
-To try it on one Mac, leave `--inject` off and view `127.0.0.1`. Injection is off so the viewer's pointer cannot drive the host and feed back into itself. `--inject` posts mouse and keyboard into the host Mac. That is the setup for two machines.
+State files (pid, pairing code, log) live in:
 
-`--listen 127.0.0.1` keeps the host on this Mac only. `--listen 0.0.0.0:9787` is the same reachability as the default, limited to IPv4.
+| System | Directory |
+| --- | --- |
+| macOS | `~/Library/Application Support/deskbridge/` |
+| Linux | `$XDG_STATE_HOME/deskbridge` or `~/.local/state/deskbridge` |
+| Windows | `%LOCALAPPDATA%\deskbridge` |
 
-`--fingerprint` is optional. It is the SHA-256 of the host certificate, printed next to the pairing code. Pass it when you want to pin a host you have seen before.
+`DESKBRIDGE_STATE_DIR` overrides that directory.
 
-## SSH keys
+`--listen 127.0.0.1` keeps the host on this Mac only. The default listens on every interface. `--listen 0.0.0.0:9787` is the same reachability, limited to IPv4.
 
-The host can admit a viewer that signs a one-time challenge with an `ssh-ed25519` private key. The host keeps only the public key. The private key stays in the SSH agent.
+### SSH keys
 
-Authorize a key by repeating `--key` with the public-key line, by naming a GitHub account, or by putting lines in `authorized_keys` in the state directory (`~/Library/Application Support/deskbridge/` on macOS):
+The host can admit a viewer that signs a one-time challenge with an `ssh-ed25519` private key. The host stores the public key. The private key stays in the SSH agent.
 
-```
+Authorize keys with `--key`, with `--github`, or with lines in `authorized_keys` in the state directory:
+
+```sh
 deskbridge host --daemon --inject --key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... comment"
 deskbridge host --daemon --inject --github yourname
 ```
 
-`--github` reads `https://github.com/yourname.keys` when the host starts and authorizes every `ssh-ed25519` key on that account. Other key types on the account are skipped. Repeat the flag for more than one account. Restart the host after adding a key on GitHub.
+`--github` reads `https://github.com/yourname.keys` when the host starts and authorizes every `ssh-ed25519` key on that account. Other key types are skipped. Repeat the flag for more than one account. Restart the host after adding a key on GitHub.
 
-On the viewer, Deskbridge asks the agent in `SSH_AUTH_SOCK` and the 1Password agent socket, and signs with the one that holds the matching private key. 1Password prompts before it signs. The host sends the public keys it accepts.
+The viewer asks the agent in `SSH_AUTH_SOCK` and the 1Password agent socket, and signs with the key the host accepts. 1Password prompts before it signs.
 
-```
+```sh
 deskbridge view 100.x.x.x
 deskbridge view 100.x.x.x --key "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... comment"
 ```
 
-With one matching key, the viewer uses it. With several, pass `--key` to choose. `--code` still works for a guest, including when the host also has authorized keys. A rejected proof does not stop the host; it waits for the next viewer.
+One matching key is used automatically. With several matches, pass `--key` to choose. `--code` still admits a guest. A rejected login does not stop the host.
+
+`--fingerprint` is optional. It is the SHA-256 of the host certificate, printed next to the pairing code. Pass it to pin a host you have seen before.
 
 ## Permissions
 
-The host checks permissions before it listens. It needs Screen Recording. `--inject` also needs Accessibility, so the host can post mouse and keyboard events. Loopback on one Mac does not need Accessibility.
+The host checks permissions before it listens.
 
-If a permission is off, the host opens the system prompt and exits. macOS applies the grant on the next launch, so start `deskbridge host` again after turning it on for the terminal that runs it.
+- Screen Recording is required.
+- Accessibility is required with `--inject`.
 
-## What this build does not do
+If a permission is off, the host opens the system prompt and exits. macOS applies the grant on the next launch, so start the host again after turning it on. From Terminal, the grant belongs to that terminal app. From SSH with `--daemon`, the grant belongs to the `deskbridge` program, and the prompt is on the Mac’s screen.
 
-Audio, clipboard, file transfer, multiple monitors, mobile viewers, discovery, NAT traversal, and a software encoder. Those stay off this binary so it can stay small. A later build can add OpenH264 for machines with no hardware encoder. This one will not open a software HEVC or H.264 encoder.
+If the viewer prints `timed out`, the host is not receiving packets. Confirm the host log says it is listening on every interface, and allow incoming UDP 9787.
 
-Linux and Windows 64-bit binaries build and run the protocol tools. Screen capture and the viewer window are still the macOS backend. `crates/platform-linux` is the home for PipeWire or X11 capture with VAAPI or OpenH264. `crates/platform-windows` is the home for Windows.Graphics.Capture and Media Foundation.
+## Project layout
 
-## Build
+| Path | Role |
+| --- | --- |
+| `crates/deskbridge` | Command-line program |
+| `crates/proto` | Wire messages |
+| `crates/session` | QUIC session, pairing, SSH authentication |
+| `crates/platform-macos` | ScreenCaptureKit, VideoToolbox, window, input |
+| `crates/platform-linux` | Linux command-line stubs |
+| `crates/platform-windows` | Windows command-line stubs |
 
-```
-cargo test
-cargo build --release
-```
+## License
 
-The macOS release binary is `target/release/deskbridge`. It is built with thin LTO and stripped symbols.
-
-64-bit Linux and Windows binaries, from a machine with Docker:
-
-```
-build/package-64.sh
-```
-
-That writes `dist/deskbridge-linux-x86_64` and `dist/deskbridge-windows-x86_64.exe`.
-
-Release binary size: 3.7 MB (3,901,488 bytes) on Apple Silicon.
-
-Deskbridge is licensed under the MIT License. See `LICENSE`.
+[MIT](LICENSE). Copyright 2026 Mike Littman.

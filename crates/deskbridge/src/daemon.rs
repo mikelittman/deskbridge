@@ -80,7 +80,10 @@ pub fn paths() -> Result<Paths, PlatformError> {
 
 /// Called in the detached process before it listens.
 pub fn prepare_child() -> Result<SessionFiles, PlatformError> {
-    become_session_leader();
+    // A launchd GUI job must stay in that session. setsid would leave it.
+    if std::env::var_os("DESKBRIDGE_LAUNCHD").is_none() {
+        become_session_leader();
+    }
     let paths = paths()?;
     fs::create_dir_all(&paths.dir).map_err(PlatformError::new)?;
     let _ = std::env::set_current_dir(&paths.dir);
@@ -89,8 +92,32 @@ pub fn prepare_child() -> Result<SessionFiles, PlatformError> {
     Ok(SessionFiles { paths })
 }
 
+/// True when this process is not in the desktop session, for example an SSH shell.
+///
+/// Screen Recording follows the desktop session. Starting the host from SSH makes
+/// macOS ask for sshd instead of deskbridge.
+pub fn needs_gui_launch() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        manager_name().as_deref() != Some("Aqua")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 /// Start a detached host and wait until it publishes a pairing code.
 pub fn spawn() -> Result<(), PlatformError> {
+    let paths = reserve_slot()?;
+    #[cfg(target_os = "macos")]
+    if needs_gui_launch() {
+        return spawn_via_launchd(&paths);
+    }
+    spawn_detached(&paths)
+}
+
+fn reserve_slot() -> Result<Paths, PlatformError> {
     let paths = paths()?;
     if let Some(pid) = live_pid(&paths) {
         return Err(PlatformError::new(format!(
@@ -101,6 +128,10 @@ pub fn spawn() -> Result<(), PlatformError> {
     let _ = fs::remove_file(&paths.state);
     let _ = fs::remove_file(&paths.stop);
     fs::create_dir_all(&paths.dir).map_err(PlatformError::new)?;
+    Ok(paths)
+}
+
+fn spawn_detached(paths: &Paths) -> Result<(), PlatformError> {
     let log = OpenOptions::new()
         .create(true)
         .write(true)
@@ -118,39 +149,347 @@ pub fn spawn() -> Result<(), PlatformError> {
         .stderr(Stdio::from(log_err));
     configure_detached(&mut cmd);
     let mut child = cmd.spawn().map_err(PlatformError::new)?;
+    wait_until_ready(paths, |paths| {
+        match child.try_wait() {
+            Ok(None) => Ok(true),
+            Ok(Some(status)) => {
+                let _ = fs::remove_file(&paths.pid);
+                Err(exited_message(paths, &format!("background host exited ({status})")))
+            }
+            Err(err) => Err(PlatformError::new(err)),
+        }
+    })
+}
+
+fn announce(paths: &Paths, state: &HostState) {
+    println!("host running in the background");
+    println!("pid {}", state.pid);
+    println!("pairing code: {}", state.code);
+    println!("fingerprint:  {}", state.fingerprint);
+    println!("listening on {}", state.listen);
+    println!("log: {}", paths.log.display());
+    println!("`deskbridge status` prints this again. `deskbridge stop` ends the host.");
+}
+
+fn exited_message(paths: &Paths, prefix: &str) -> PlatformError {
+    let log_text = fs::read_to_string(&paths.log).unwrap_or_default();
+    let detail = log_text.trim();
+    if detail.is_empty() {
+        PlatformError::new(prefix)
+    } else {
+        PlatformError::new(format!("{prefix}\n{detail}"))
+    }
+}
+
+fn wait_until_ready(
+    paths: &Paths,
+    mut still_running: impl FnMut(&Paths) -> Result<bool, PlatformError>,
+) -> Result<(), PlatformError> {
     let started = Instant::now();
     loop {
-        if let Some(state) = read_state(&paths)? {
-            println!("host running in the background");
-            println!("pid {}", state.pid);
-            println!("pairing code: {}", state.code);
-            println!("fingerprint:  {}", state.fingerprint);
-            println!("listening on {}", state.listen);
-            println!("log: {}", paths.log.display());
-            println!("`deskbridge status` prints this again. `deskbridge stop` ends the host.");
+        if let Some(state) = read_state(paths)? {
+            announce(paths, &state);
             return Ok(());
         }
-        if let Some(status) = child.try_wait().map_err(PlatformError::new)? {
-            let _ = fs::remove_file(&paths.pid);
-            let log_text = fs::read_to_string(&paths.log).unwrap_or_default();
-            let detail = log_text.trim();
-            let message = if detail.is_empty() {
-                format!("background host exited ({status})")
+        if !still_running(paths)? {
+            let log = fs::read_to_string(&paths.log).unwrap_or_default();
+            let grace = if log.trim().is_empty() {
+                Duration::from_secs(3)
             } else {
-                format!("background host exited ({status})\n{detail}")
+                Duration::from_millis(800)
             };
-            return Err(PlatformError::new(message));
+            if started.elapsed() > grace {
+                return Err(exited_message(paths, "background host exited"));
+            }
         }
         if started.elapsed() > READY_WAIT {
-            let _ = signal_term(child.id());
-            let _ = signal_kill(child.id());
-            return Err(PlatformError::new(format!(
-                "background host did not become ready. See {}",
-                paths.log.display()
-            )));
+            return Err(exited_message(
+                paths,
+                &format!(
+                    "background host did not become ready. See {}",
+                    paths.log.display()
+                ),
+            ));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[cfg(target_os = "macos")]
+const LAUNCHD_LABEL: &str = "com.deskbridge.host";
+
+#[cfg(target_os = "macos")]
+fn spawn_via_launchd(paths: &Paths) -> Result<(), PlatformError> {
+    let domain = gui_domain();
+    if !launchctl_ok(&["print", &domain]) {
+        return Err(PlatformError::new(
+            "the Mac is not logged in at the desktop. Log in on the screen, then start the host again. Screen Recording belongs to that desktop session.",
+        ));
+    }
+    println!("starting the host in the desktop session so macOS asks for deskbridge, not the SSH session");
+    let exe = std::env::current_exe().map_err(PlatformError::new)?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let plist_path = paths.dir.join("host.plist");
+    let mut env = vec![
+        ("DESKBRIDGE_DAEMON".to_string(), "1".to_string()),
+        ("DESKBRIDGE_LAUNCHD".to_string(), "1".to_string()),
+    ];
+    // The desktop job must use this same directory. Its HOME can differ from the SSH shell.
+    env.push(("DESKBRIDGE_STATE_DIR".to_string(), paths.dir.display().to_string()));
+    let plist = launchd_plist(&exe, &args, &paths.log, &paths.dir, &env);
+    fs::write(&plist_path, plist).map_err(PlatformError::new)?;
+    let _ = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&paths.log);
+    clear_quarantine(&exe);
+    let service = format!("{domain}/{LAUNCHD_LABEL}");
+    let _ = launchctl(&["bootout", &service]);
+    launchctl(&[
+        "bootstrap",
+        &domain,
+        &plist_path.display().to_string(),
+    ])?;
+    // bootstrap only loads the job. kickstart is what runs it.
+    let launched = match kickstart_pid(&service) {
+        Ok(pid) => pid,
+        Err(err) => {
+            if !job_alive(paths, None, &service) {
+                let status = service_status(&service);
+                let _ = launchctl(&["bootout", &service]);
+                return Err(PlatformError::new(format!("{err}\n{status}")));
+            }
+            None
+        }
+    };
+    if let Some(pid) = launched {
+        // status and stop can see the process before it writes its own pid file.
+        let _ = fs::write(&paths.pid, format!("{pid}\n"));
+    }
+    let ready = wait_until_ready(paths, {
+        let service = service.clone();
+        move |paths| Ok(job_alive(paths, launched, &service))
+    });
+    if let Err(err) = ready {
+        if job_alive(paths, launched, &service) {
+            let pid = launched
+                .or_else(|| live_pid(paths))
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            println!("host is still starting in the desktop session (pid {pid})");
+            println!("If macOS is showing a prompt on the screen, approve deskbridge.");
+            println!("`deskbridge status` prints the pairing code when the host is listening.");
+            println!("log: {}", paths.log.display());
+            return Ok(());
+        }
+        let status = service_status(&service);
+        let _ = launchctl(&["bootout", &service]);
+        return Err(PlatformError::new(format!("{err}\n{status}")));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn job_alive(paths: &Paths, launched: Option<u32>, service: &str) -> bool {
+    live_pid(paths).is_some()
+        || launched.is_some_and(process_alive)
+        || service_pid(service).is_some_and(process_alive)
+}
+
+#[cfg(target_os = "macos")]
+fn kickstart_pid(service: &str) -> Result<Option<u32>, PlatformError> {
+    let output = Command::new("/bin/launchctl")
+        .args(["kickstart", "-p", service])
+        .output()
+        .map_err(PlatformError::new)?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let extra = String::from_utf8_lossy(&output.stdout);
+        let detail = detail.trim();
+        let extra = extra.trim();
+        let message = if detail.is_empty() { extra } else if extra.is_empty() { detail } else { detail };
+        return Err(PlatformError::new(format!(
+            "launchctl kickstart -p {service} failed: {message}"
+        )));
+    }
+    Ok(first_pid(&String::from_utf8_lossy(&output.stdout)))
+}
+
+#[cfg(target_os = "macos")]
+fn clear_quarantine(exe: &std::path::Path) {
+    // A copy in Downloads is quarantined. launchd then leaves the process paused
+    // until the screen prompt is answered, and the SSH command used to stop it.
+    let _ = Command::new("/usr/bin/xattr")
+        .args(["-d", "com.apple.quarantine"])
+        .arg(exe)
+        .output();
+}
+
+fn first_pid(text: &str) -> Option<u32> {
+    text.split_whitespace().find_map(|word| word.parse().ok())
+}
+
+fn top_level_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key} = ");
+    for line in text.lines() {
+        if !(line.starts_with('\t') && !line.starts_with("\t\t")) {
+            continue;
+        }
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            return Some(rest.trim());
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn service_pid(service: &str) -> Option<u32> {
+    top_level_field(&launchctl_text(&["print", service]), "pid").and_then(|value| value.parse().ok())
+}
+
+#[cfg(target_os = "macos")]
+fn service_status(service: &str) -> String {
+    let text = launchctl_text(&["print", service]);
+    let mut kept = Vec::new();
+    for key in ["path", "state", "program", "pid", "runs", "last exit code"] {
+        if let Some(value) = top_level_field(&text, key) {
+            kept.push(format!("{key} = {value}"));
+        }
+    }
+    if kept.is_empty() {
+        text.trim().to_string()
+    } else {
+        kept.join("\n")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_text(args: &[&str]) -> String {
+    let Ok(output) = Command::new("/bin/launchctl").args(args).output() else {
+        return String::new();
+    };
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let err = String::from_utf8_lossy(&output.stderr);
+    if !err.trim().is_empty() {
+        text.push('\n');
+        text.push_str(err.trim());
+    }
+    text
+}
+
+#[cfg(target_os = "macos")]
+fn bootout_gui_job() {
+    let domain = gui_domain();
+    let _ = launchctl(&["bootout", &format!("{domain}/{LAUNCHD_LABEL}")]);
+}
+
+#[cfg(target_os = "macos")]
+fn gui_domain() -> String {
+    format!("gui/{}", unsafe { libc::getuid() })
+}
+
+#[cfg(target_os = "macos")]
+fn manager_name() -> Option<String> {
+    let output = Command::new("/bin/launchctl").arg("managername").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let name = String::from_utf8(output.stdout).ok()?;
+    let name = name.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl(args: &[&str]) -> Result<(), PlatformError> {
+    let output = Command::new("/bin/launchctl")
+        .args(args)
+        .output()
+        .map_err(PlatformError::new)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr);
+    let detail = detail.trim();
+    let extra = String::from_utf8_lossy(&output.stdout);
+    let extra = extra.trim();
+    let message = match (detail.is_empty(), extra.is_empty()) {
+        (false, false) => format!("launchctl {} failed: {detail} {extra}", args.join(" ")),
+        (false, true) => format!("launchctl {} failed: {detail}", args.join(" ")),
+        (true, false) => format!("launchctl {} failed: {extra}", args.join(" ")),
+        (true, true) => format!("launchctl {} failed", args.join(" ")),
+    };
+    Err(PlatformError::new(message))
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_ok(args: &[&str]) -> bool {
+    launchctl(args).is_ok()
+}
+
+fn launchd_plist(
+    exe: &std::path::Path,
+    args: &[String],
+    log: &std::path::Path,
+    workdir: &std::path::Path,
+    env: &[(String, String)],
+) -> String {
+    let mut arguments = String::new();
+    arguments.push_str(&format!("\t\t<string>{}</string>\n", xml_escape(&exe.display().to_string())));
+    for arg in args {
+        arguments.push_str(&format!("\t\t<string>{}</string>\n", xml_escape(arg)));
+    }
+    let mut variables = String::new();
+    for (key, value) in env {
+        variables.push_str(&format!(
+            "\t\t<key>{}</key>\n\t\t<string>{}</string>\n",
+            xml_escape(key),
+            xml_escape(value)
+        ));
+    }
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.deskbridge.host</string>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>ProgramArguments</key>
+	<array>
+{arguments}	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+{variables}	</dict>
+	<key>WorkingDirectory</key>
+	<string>{workdir}</string>
+	<key>StandardOutPath</key>
+	<string>{log}</string>
+	<key>StandardErrorPath</key>
+	<string>{log}</string>
+</dict>
+</plist>
+"#,
+        arguments = arguments,
+        variables = variables,
+        workdir = xml_escape(&workdir.display().to_string()),
+        log = xml_escape(&log.display().to_string()),
+    )
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 pub fn status() -> Result<(), PlatformError> {
@@ -174,12 +513,20 @@ pub fn status() -> Result<(), PlatformError> {
 
 pub fn stop() -> Result<(), PlatformError> {
     let paths = paths()?;
-    let Some(pid) = live_pid(&paths) else {
+    let pid = live_pid(&paths);
+    if pid.is_some() {
+        fs::write(&paths.stop, b"stop\n").map_err(PlatformError::new)?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        bootout_gui_job();
+        let _ = fs::remove_file(paths.dir.join("host.plist"));
+    }
+    let Some(pid) = pid else {
         let _ = fs::remove_file(&paths.pid);
         let _ = fs::remove_file(&paths.state);
         return Err(PlatformError::new("host is not running"));
     };
-    fs::write(&paths.stop, b"stop\n").map_err(PlatformError::new)?;
     let _ = signal_term(pid);
     let started = Instant::now();
     while process_alive(pid) && started.elapsed() < Duration::from_secs(5) {
@@ -501,6 +848,42 @@ mod tests {
         #[cfg(target_os = "windows")]
         assert!(text.contains("deskbridge"), "{text}");
         assert!(dir.is_absolute());
+    }
+
+    #[test]
+    fn the_launchd_plist_names_deskbridge_and_escapes_arguments() {
+        let plist = launchd_plist(
+            std::path::Path::new("/usr/local/bin/deskbridge"),
+            &["host".into(), "--key".into(), "a & b <c>".into()],
+            std::path::Path::new("/tmp/deskbridge/host.log"),
+            std::path::Path::new("/tmp/deskbridge"),
+            &[
+                ("DESKBRIDGE_DAEMON".into(), "1".into()),
+                ("DESKBRIDGE_LAUNCHD".into(), "1".into()),
+            ],
+        );
+        assert!(plist.contains("<string>/usr/local/bin/deskbridge</string>"));
+        assert!(plist.contains("<string>a &amp; b &lt;c&gt;</string>"));
+        assert!(plist.contains("<string>Aqua</string>"));
+        assert!(plist.contains("<key>DESKBRIDGE_LAUNCHD</key>"));
+        assert!(plist.contains("<string>com.deskbridge.host</string>"));
+        assert_eq!(first_pid("32353\n"), Some(32353));
+        assert_eq!(first_pid("not a pid"), None);
+        let printed = "\tstate = running\n\tpid = 42\n\t\tstate = active\n";
+        assert_eq!(top_level_field(printed, "state"), Some("running"));
+        assert_eq!(top_level_field(printed, "pid"), Some("42"));
+        #[cfg(target_os = "macos")]
+        {
+            let path = std::env::temp_dir().join(format!("deskbridge-plist-{}.plist", std::process::id()));
+            std::fs::write(&path, &plist).unwrap();
+            let status = std::process::Command::new("/usr/bin/plutil")
+                .arg("-lint")
+                .arg(&path)
+                .status()
+                .unwrap();
+            let _ = std::fs::remove_file(&path);
+            assert!(status.success(), "plist did not parse");
+        }
     }
 
     #[test]

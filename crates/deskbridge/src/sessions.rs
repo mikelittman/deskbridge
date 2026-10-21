@@ -93,6 +93,9 @@ pub async fn serve(
                     &mut running,
                     &mut live_generation,
                     &mut picture,
+                    &plan,
+                    &mut next_generation,
+                    &bridge_tx,
                 );
             }
             message = bridge_rx.recv() => {
@@ -142,6 +145,7 @@ struct CapturePlan {
 struct RunningCapture {
     host: Host,
     pump: JoinHandle<()>,
+    limit: Option<(u32, u32)>,
 }
 
 enum BridgeMsg {
@@ -155,6 +159,7 @@ struct LiveViewer {
     paired: PairedHost,
     reader: JoinHandle<()>,
     synced: bool,
+    resolution: Option<(u32, u32)>,
 }
 
 enum FromViewer {
@@ -237,23 +242,25 @@ fn admit(
         tokio::spawn(async move { paired.shutdown().await });
         return;
     }
-    if running.is_none() {
-        match start_capture(plan, next_generation, live_generation, bridge_tx.clone()) {
-            Ok(capture) => *running = Some(capture),
-            Err(err) => {
-                *live_generation = None;
-                eprintln!("deskbridge: {err}");
-                tokio::spawn(async move { paired.shutdown().await });
-                return;
-            }
-        }
+    let mut requests: Vec<Option<(u32, u32)>> = viewers.iter().map(|viewer| viewer.resolution).collect();
+    requests.push(paired.resolution);
+    let aligned = ensure_capture(
+        &requests,
+        viewers,
+        running,
+        live_generation,
+        picture,
+        plan,
+        next_generation,
+        bridge_tx.clone(),
+    );
+    if !aligned {
+        tokio::spawn(async move { paired.shutdown().await });
+        return;
     }
     let id = *next_id;
     *next_id = next_id.saturating_add(1);
-    if let Some(capture) = running.as_ref() {
-        capture.host.set_viewer_count(viewers.len() + 1);
-        paired.share_backlog(capture.host.video_backlog());
-    }
+    share_capture(running, viewers, Some(&paired));
     let synced = picture.replay(&paired);
     if !synced {
         if let Some(capture) = running.as_ref() {
@@ -262,13 +269,16 @@ fn admit(
     }
     let reader = watch_viewer(id, &mut paired, notes_tx.clone());
     let proof = paired.viewer.clone();
+    let resolution = paired.resolution;
+    let limit = running.as_ref().and_then(|capture| capture.limit);
     viewers.push(LiveViewer {
         id,
         paired,
         reader,
         synced,
+        resolution,
     });
-    host_line(paired_line(&proof, viewers.len(), plan.codec));
+    host_line(paired_line(&proof, viewers.len(), plan.codec, limit));
 }
 
 fn on_note(
@@ -277,6 +287,9 @@ fn on_note(
     running: &mut Option<RunningCapture>,
     live_generation: &mut Option<u64>,
     picture: &mut SharedPicture,
+    plan: &CapturePlan,
+    next_generation: &mut u64,
+    bridge_tx: &UnboundedSender<BridgeMsg>,
 ) {
     match note.event {
         FromViewer::Input(input) => {
@@ -300,9 +313,19 @@ fn on_note(
                 release_capture(running, live_generation, picture);
                 host_line("viewer left. waiting for a viewer");
             } else {
-                if let Some(capture) = running.as_ref() {
-                    capture.host.set_viewer_count(viewers.len());
-                }
+                let requests: Vec<Option<(u32, u32)>> =
+                    viewers.iter().map(|viewer| viewer.resolution).collect();
+                ensure_capture(
+                    &requests,
+                    viewers,
+                    running,
+                    live_generation,
+                    picture,
+                    plan,
+                    next_generation,
+                    bridge_tx.clone(),
+                );
+                share_capture(running, viewers, None);
                 let count = viewers.len();
                 host_line(format!("viewer left ({count} still connected)"));
             }
@@ -369,8 +392,80 @@ fn publish_frame(viewers: &mut [LiveViewer], picture: &mut SharedPicture, frame:
     behind
 }
 
+/// The picture fits inside the host ceiling and every viewer's request.
+/// A viewer that does not ask leaves the limit unchanged.
+fn picture_limit(host: Option<(u32, u32)>, requests: &[Option<(u32, u32)>]) -> Option<(u32, u32)> {
+    let mut limit = host;
+    for request in requests {
+        if let Some((width, height)) = *request {
+            limit = Some(match limit {
+                Some((limit_w, limit_h)) => (limit_w.min(width), limit_h.min(height)),
+                None => (width, height),
+            });
+        }
+    }
+    limit
+}
+
+fn ensure_capture(
+    requests: &[Option<(u32, u32)>],
+    viewers: &mut [LiveViewer],
+    running: &mut Option<RunningCapture>,
+    live_generation: &mut Option<u64>,
+    picture: &mut SharedPicture,
+    plan: &CapturePlan,
+    next_generation: &mut u64,
+    bridge_tx: UnboundedSender<BridgeMsg>,
+) -> bool {
+    let limit = picture_limit(plan.resolution, requests);
+    if running.as_ref().map(|capture| capture.limit) == Some(limit) {
+        return true;
+    }
+    let previous = running.as_ref().map(|capture| capture.limit);
+    if running.is_some() {
+        release_capture(running, live_generation, picture);
+        for viewer in viewers.iter_mut() {
+            viewer.synced = false;
+        }
+    }
+    match start_capture(plan, limit, next_generation, live_generation, bridge_tx.clone()) {
+        Ok(capture) => {
+            *running = Some(capture);
+            true
+        }
+        Err(err) => {
+            eprintln!("deskbridge: {err}");
+            if let Some(previous) = previous {
+                if let Ok(capture) =
+                    start_capture(plan, previous, next_generation, live_generation, bridge_tx)
+                {
+                    *running = Some(capture);
+                    return true;
+                }
+            }
+            false
+        }
+    }
+}
+
+fn share_capture(running: &Option<RunningCapture>, viewers: &[LiveViewer], extra: Option<&PairedHost>) {
+    let Some(capture) = running.as_ref() else {
+        return;
+    };
+    for viewer in viewers {
+        viewer.paired.share_backlog(capture.host.video_backlog());
+    }
+    if let Some(extra) = extra {
+        extra.share_backlog(capture.host.video_backlog());
+    }
+    capture
+        .host
+        .set_viewer_count(viewers.len() + usize::from(extra.is_some()));
+}
+
 fn start_capture(
     plan: &CapturePlan,
+    limit: Option<(u32, u32)>,
     next_generation: &mut u64,
     live_generation: &mut Option<u64>,
     bridge_tx: UnboundedSender<BridgeMsg>,
@@ -385,7 +480,7 @@ fn start_capture(
             bitrate: plan.bitrate,
             inject: plan.inject,
             codec: plan.codec,
-            resolution: plan.resolution,
+            resolution: limit,
         },
         tx,
     )
@@ -402,7 +497,7 @@ fn start_capture(
         }
         let _ = bridge_tx.send(BridgeMsg::Ended { generation });
     });
-    Ok(RunningCapture { host, pump })
+    Ok(RunningCapture { host, pump, limit })
 }
 
 fn release_capture(
@@ -435,14 +530,23 @@ fn host_line(text: impl std::fmt::Display) {
     let _ = std::io::stdout().flush();
 }
 
-fn paired_line(proof: &ViewerProof, count: usize, codec: CodecId) -> String {
+fn paired_line(
+    proof: &ViewerProof,
+    count: usize,
+    codec: CodecId,
+    limit: Option<(u32, u32)>,
+) -> String {
     let how = match proof {
         ViewerProof::PairingCode => "pairing code".to_string(),
         ViewerProof::SshKey { comment } if comment.is_empty() => "ssh key".to_string(),
         ViewerProof::SshKey { comment } => format!("ssh key ({comment})"),
     };
     let noun = if count == 1 { "viewer" } else { "viewers" };
-    format!("paired by {how} ({count} {noun}), encoding {}", codec.name())
+    let size = match limit {
+        Some((width, height)) => format!(", picture at most {width}x{height}"),
+        None => String::new(),
+    };
+    format!("paired by {how} ({count} {noun}){size}, encoding {}", codec.name())
 }
 
 async fn shutdown_requested() {
@@ -484,5 +588,25 @@ async fn shutdown_requested() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::picture_limit;
+
+    #[test]
+    fn a_viewer_request_tightens_the_host_ceiling() {
+        assert_eq!(picture_limit(None, &[None]), None);
+        assert_eq!(picture_limit(Some((1920, 1080)), &[None]), Some((1920, 1080)));
+        assert_eq!(picture_limit(None, &[Some((1280, 720))]), Some((1280, 720)));
+        assert_eq!(
+            picture_limit(Some((3840, 2160)), &[Some((1280, 720))]),
+            Some((1280, 720))
+        );
+        assert_eq!(
+            picture_limit(None, &[None, Some((1920, 1080)), Some((1280, 720))]),
+            Some((1280, 720))
+        );
     }
 }

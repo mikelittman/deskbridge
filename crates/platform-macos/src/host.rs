@@ -16,7 +16,7 @@ use crate::encode::Encoder;
 use crate::error::PlatformError;
 use crate::input::Injector;
 use crate::pace::{encode_fps, FramePace};
-use crate::preview::{needs_preview, Preview};
+use crate::preview::{needs_preview, FrameFit, Preview};
 
 pub struct HostOptions {
     pub display_index: usize,
@@ -180,7 +180,8 @@ fn run(
             return Err(err);
         }
     };
-    let mut preview = if needs_preview(capture.info.width, capture.info.height) {
+    // A viewer who asked for a size should get that size, not the small first picture.
+    let mut preview = if options.resolution.is_none() && needs_preview(capture.info.width, capture.info.height) {
         match Preview::open(options.codec, capture.info.width, capture.info.height, capture.fps) {
             Ok(preview) => Some(preview),
             Err(err) => {
@@ -244,6 +245,9 @@ fn run(
     let mut pending: Option<CapturedFrame> = None;
     let mut idle_encode_failed = false;
     let mut encoder_failed = false;
+    let mut fit: Option<FrameFit> = None;
+    let target_w = capture.info.width;
+    let target_h = capture.info.height;
     while !stop.load(Ordering::Relaxed) {
         if let Some(frame) = capture.wait_frame(Duration::from_millis(8)) {
             let unchanged = matches!(frame.changed, Some(fraction) if fraction <= 0.0);
@@ -312,8 +316,11 @@ fn run(
                     let capture_us = frame.capture_us;
                     let force = force_key.swap(false, Ordering::Relaxed);
                     encoder.set_target_fps(encode_fps(capture.fps, changed));
-                    match emit(
+                    match emit_fitted(
                         encoder,
+                        &mut fit,
+                        target_w,
+                        target_h,
                         &outbound,
                         &frame.surface,
                         capture_us,
@@ -343,8 +350,11 @@ fn run(
                         let force = force_key.swap(false, Ordering::Relaxed);
                         if force {
                             encoder.set_target_fps(encode_fps(capture.fps, changed));
-                            match emit(
+                            match emit_fitted(
                                 encoder,
+                                &mut fit,
+                                target_w,
+                                target_h,
                                 &outbound,
                                 &frame.surface,
                                 mono_us(),
@@ -366,6 +376,51 @@ fn run(
     }
     capture.stop();
     Ok(())
+}
+
+fn emit_fitted(
+    encoder: &mut Encoder,
+    fit: &mut Option<FrameFit>,
+    target_w: u32,
+    target_h: u32,
+    outbound: &UnboundedSender<Outbound>,
+    source: &apple_cf::iosurface::IOSurface,
+    capture_us: u64,
+    force: bool,
+    force_key: &AtomicBool,
+) -> Option<usize> {
+    let wider = source.width() > target_w as usize || source.height() > target_h as usize;
+    if !wider {
+        return emit(encoder, outbound, source, capture_us, force, force_key);
+    }
+    if fit.is_none() {
+        match FrameFit::open(target_w, target_h) {
+            Ok(opened) => {
+                eprintln!(
+                    "capture arrived at {}x{}; encoding {target_w}x{target_h} for the viewer",
+                    source.width(),
+                    source.height()
+                );
+                *fit = Some(opened);
+            }
+            Err(err) => {
+                eprintln!("scale: {err}");
+                force_key.store(true, Ordering::Relaxed);
+                return None;
+            }
+        }
+    }
+    let Some(fit) = fit.as_mut() else {
+        return None;
+    };
+    match fit.apply(source) {
+        Ok(scaled) => emit(encoder, outbound, scaled, capture_us, force, force_key),
+        Err(err) => {
+            eprintln!("scale: {err}");
+            force_key.store(true, Ordering::Relaxed);
+            None
+        }
+    }
 }
 
 fn emit(
