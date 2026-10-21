@@ -38,8 +38,9 @@ security import "$certificate" -P "$APPLE_CERTIFICATE_PASSWORD" -A -f pkcs12 -k 
 # The temporary keychain does not contain Apple's intermediates, so trust evaluation fails.
 curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
 curl -fsSL -o "$RUNNER_TEMP/AppleWWDRCAG3.cer" https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
-security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain" -T /usr/bin/codesign
-security import "$RUNNER_TEMP/AppleWWDRCAG3.cer" -k "$keychain" -T /usr/bin/codesign
+# These intermediates are often already in the system keychain. That is not a failure.
+security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain" -T /usr/bin/codesign || true
+security import "$RUNNER_TEMP/AppleWWDRCAG3.cer" -k "$keychain" -T /usr/bin/codesign || true
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
 search_list="$keychain"
 if [ -e "$HOME/Library/Keychains/login.keychain-db" ]; then
