@@ -16,6 +16,8 @@ identity=$(security find-identity -p codesigning -v \
   | head -1)
 if [ -z "$identity" ]; then
   echo "no Developer ID Application certificate in the keychain" >&2
+  echo "identities found:" >&2
+  security find-identity -p codesigning || true
   exit 1
 fi
 

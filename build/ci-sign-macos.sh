@@ -33,9 +33,22 @@ printf '%s' "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$certificate"
 security create-keychain -p "$keychain_password" "$keychain"
 security set-keychain-settings -lut 21600 "$keychain"
 security unlock-keychain -p "$keychain_password" "$keychain"
-security import "$certificate" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+# Import the identity. -t cert drops the private key, so codesign cannot see it.
+security import "$certificate" -P "$APPLE_CERTIFICATE_PASSWORD" -A -f pkcs12 -k "$keychain"
+# The temporary keychain does not contain Apple's intermediates, so trust evaluation fails.
+curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+curl -fsSL -o "$RUNNER_TEMP/AppleWWDRCAG3.cer" https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain" -T /usr/bin/codesign
+security import "$RUNNER_TEMP/AppleWWDRCAG3.cer" -k "$keychain" -T /usr/bin/codesign
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
-security list-keychains -d user -s "$keychain"
+search_list="$keychain"
+if [ -e "$HOME/Library/Keychains/login.keychain-db" ]; then
+  search_list="$search_list $HOME/Library/Keychains/login.keychain-db"
+fi
+# shellcheck disable=SC2086
+security list-keychains -d user -s $search_list /Library/Keychains/System.keychain
+echo "codesigning identities:"
+security find-identity -p codesigning -v || true
 
 export DESKBRIDGE_REQUIRE_NOTARIZATION=1
 "$root/build/sign-macos.sh" "$bin"
