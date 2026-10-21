@@ -28,6 +28,12 @@ use deskbridge_session::{listen, Identity};
 
 const DEFAULT_PORT: u16 = 9787;
 
+fn version_line() -> String {
+    let version = option_env!("DESKBRIDGE_VERSION").unwrap_or("dev");
+    let commit = option_env!("DESKBRIDGE_COMMIT").unwrap_or("unknown");
+    format!("{version} ({commit})")
+}
+
 fn main() -> ExitCode {
     match dispatch() {
         Ok(()) => ExitCode::SUCCESS,
@@ -45,12 +51,16 @@ fn dispatch() -> Result<(), PlatformError> {
         Some("view") => view_command(args.collect()),
         Some("status") => daemon::status(),
         Some("stop") => daemon::stop(),
+        Some("version") | Some("--version") | Some("-V") => {
+            println!("{}", version_line());
+            Ok(())
+        }
         Some("-h") | Some("--help") | None => {
             print_help();
             Ok(())
         }
         Some(other) => Err(PlatformError::new(format!(
-            "unknown command {other}. Use `deskbridge host`, `deskbridge view`, `deskbridge status`, or `deskbridge stop`."
+            "unknown command {other}. Use `deskbridge host`, `deskbridge view`, `deskbridge status`, `deskbridge stop`, or `deskbridge version`."
         ))),
     }
 }
@@ -85,9 +95,10 @@ fn print_help() {
     eprintln!(
         "\
 deskbridge host [--display N] [--listen addr:port] [--bitrate 20M] [--resolution 1080p] [--inject] [--daemon] [--key \"ssh-ed25519 AAAA...\"] [--github USER]
+deskbridge view <addr[:port]> [--code CODE] [--key \"ssh-ed25519 AAAA...\"] [--fingerprint HEX] [--resolution 1080p]
 deskbridge status
 deskbridge stop
-deskbridge view <addr[:port]> [--code CODE] [--key \"ssh-ed25519 AAAA...\"] [--fingerprint HEX] [--resolution 1080p]
+deskbridge version
 
 Direct connection only. Default port is {DEFAULT_PORT}. The host listens on every interface.
 The host prints a pairing code. Ctrl+Alt releases the viewer's pointer grab.

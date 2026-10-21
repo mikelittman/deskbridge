@@ -58,6 +58,32 @@ Outputs:
 - `dist/deskbridge-linux-x86_64`
 - `dist/deskbridge-windows-x86_64.exe`
 
+## Install
+
+A push to `main` publishes a GitHub release. The tag is `v0.0.N`, where `N` increases with each release, so Homebrew and Scoop can tell which build is newer. A short commit hash does not sort that way. `deskbridge version` prints both, for example `0.0.12 (abc1234)`.
+
+macOS, Apple Silicon, from a [Homebrew tap](https://github.com/mikelittman/deskbridge) of this repository:
+
+```sh
+brew tap mikelittman/deskbridge https://github.com/mikelittman/deskbridge
+brew install mikelittman/deskbridge/deskbridge
+```
+
+Windows, with [Scoop](https://scoop.sh):
+
+```sh
+scoop bucket add deskbridge https://github.com/mikelittman/deskbridge
+scoop install deskbridge
+```
+
+Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mikelittman/deskbridge/main/packaging/install-linux.sh | sh
+```
+
+That installs `~/.local/bin/deskbridge`. Add that directory to `PATH` if the shell does not already search it.
+
 ## Quick start
 
 On the Mac you want to watch:

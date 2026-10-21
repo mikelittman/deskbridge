@@ -1,4 +1,6 @@
 fn main() {
+    println!("cargo:rerun-if-env-changed=DESKBRIDGE_VERSION");
+    println!("cargo:rerun-if-env-changed=DESKBRIDGE_COMMIT");
     #[cfg(target_os = "macos")]
     swift_rpath::link_swift_concurrency();
 }
