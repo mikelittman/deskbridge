@@ -6,8 +6,8 @@
 use std::io::Write;
 use std::time::Duration;
 
-use deskbridge_platform_macos::{Host, HostOptions, Outbound};
-use deskbridge_proto::{CodecId, Control, Input, VideoFrame};
+use crate::platform::{Host, HostOptions, Outbound};
+use deskbridge_proto::{AudioPacket, CodecId, Control, Input, VideoFrame};
 use deskbridge_session::{
     accept_one, close_endpoint, AuthorizedKey, Endpoint, Identity, PairedHost, ViewerProof,
 };
@@ -114,6 +114,11 @@ pub async fn serve(
                             }
                         }
                     }
+                    Some(BridgeMsg::Audio { generation, packet })
+                        if live_generation == Some(generation) =>
+                    {
+                        publish_audio(&viewers, packet);
+                    }
                     Some(BridgeMsg::Ended { generation }) if live_generation == Some(generation) => {
                         eprintln!("deskbridge: capture stopped");
                         release_capture(&mut running, &mut live_generation, &mut picture);
@@ -151,6 +156,7 @@ struct RunningCapture {
 enum BridgeMsg {
     Control { generation: u64, control: Control },
     Frame { generation: u64, frame: VideoFrame },
+    Audio { generation: u64, packet: AudioPacket },
     Ended { generation: u64 },
 }
 
@@ -356,6 +362,12 @@ fn watch_viewer(id: u64, paired: &mut PairedHost, notes_tx: UnboundedSender<View
     })
 }
 
+fn publish_audio(viewers: &[LiveViewer], packet: AudioPacket) {
+    for viewer in viewers {
+        viewer.paired.send_audio(packet.clone());
+    }
+}
+
 fn publish_control(viewers: &[LiveViewer], picture: &mut SharedPicture, message: Control) {
     picture.note_control(&message);
     for viewer in viewers {
@@ -454,9 +466,11 @@ fn share_capture(running: &Option<RunningCapture>, viewers: &[LiveViewer], extra
     };
     for viewer in viewers {
         viewer.paired.share_backlog(capture.host.video_backlog());
+        viewer.paired.share_link(capture.host.link_health());
     }
     if let Some(extra) = extra {
         extra.share_backlog(capture.host.video_backlog());
+        extra.share_link(capture.host.link_health());
     }
     capture
         .host
@@ -490,6 +504,7 @@ fn start_capture(
             let event = match message {
                 Outbound::Control(control) => BridgeMsg::Control { generation, control },
                 Outbound::Frame(frame) => BridgeMsg::Frame { generation, frame },
+                Outbound::Audio(packet) => BridgeMsg::Audio { generation, packet },
             };
             if bridge_tx.send(event).is_err() {
                 return;

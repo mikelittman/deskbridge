@@ -101,7 +101,15 @@ pub fn needs_gui_launch() -> bool {
     {
         manager_name().as_deref() != Some("Aqua")
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        !interactive_windows_session()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         false
     }
@@ -113,6 +121,14 @@ pub fn spawn() -> Result<(), PlatformError> {
     #[cfg(target_os = "macos")]
     if needs_gui_launch() {
         return spawn_via_launchd(&paths);
+    }
+    #[cfg(target_os = "linux")]
+    if needs_gui_launch() {
+        return spawn_via_systemd(&paths);
+    }
+    #[cfg(target_os = "windows")]
+    if needs_gui_launch() {
+        return spawn_via_task(&paths);
     }
     spawn_detached(&paths)
 }
@@ -326,10 +342,12 @@ fn clear_quarantine(exe: &std::path::Path) {
         .output();
 }
 
+#[cfg(target_os = "macos")]
 fn first_pid(text: &str) -> Option<u32> {
     text.split_whitespace().find_map(|word| word.parse().ok())
 }
 
+#[cfg(target_os = "macos")]
 fn top_level_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("{key} = ");
     for line in text.lines() {
@@ -432,6 +450,7 @@ fn launchctl_ok(args: &[&str]) -> bool {
     launchctl(args).is_ok()
 }
 
+#[cfg(target_os = "macos")]
 fn launchd_plist(
     exe: &std::path::Path,
     args: &[String],
@@ -485,6 +504,7 @@ fn launchd_plist(
     )
 }
 
+#[cfg(target_os = "macos")]
 fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -753,6 +773,144 @@ fn signal_kill(pid: u32) -> bool {
     {
         let _ = pid;
         false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_via_systemd(paths: &Paths) -> Result<(), PlatformError> {
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        PlatformError::new("HOME is unset, so the desktop session cannot be found")
+    })?;
+    let unit_dir = std::path::PathBuf::from(home).join(".config/systemd/user");
+    fs::create_dir_all(&unit_dir).map_err(PlatformError::new)?;
+    let exe = std::env::current_exe().map_err(PlatformError::new)?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut exec = exe.display().to_string();
+    for arg in &args {
+        exec.push(' ');
+        exec.push_str(&shell_quote(arg));
+    }
+    let body = format!(
+        "[Unit]\nDescription=Deskbridge host\n\n[Service]\nType=simple\nExecStart={exec}\nEnvironment=DESKBRIDGE_DAEMON=1\nEnvironment=DESKBRIDGE_STATE_DIR={dir}\nWorkingDirectory={dir}\nStandardOutput=append:{log}\nStandardError=append:{log}\n\n[Install]\nWantedBy=default.target\n",
+        dir = paths.dir.display(),
+        log = paths.log.display(),
+    );
+    let unit = unit_dir.join("deskbridge.service");
+    fs::write(&unit, body).map_err(PlatformError::new)?;
+    let reload = Command::new("systemctl").args(["--user", "daemon-reload"]).status();
+    let start = Command::new("systemctl")
+        .args(["--user", "start", "deskbridge.service"])
+        .status();
+    match (reload, start) {
+        (Ok(reload), Ok(start)) if reload.success() && start.success() => {
+            wait_until_ready(paths, |_| Ok(true))
+        }
+        _ => Err(PlatformError::new(
+            "this shell is not in a desktop session, and systemd did not start the host. Log in on the screen and run deskbridge there.",
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn shell_quote(arg: &str) -> String {
+    if arg.chars().all(|ch| ch.is_ascii_alphanumeric() || "-_./".contains(ch)) {
+        arg.to_string()
+    } else {
+        format!("\"{}\"", arg.replace('"', "\\\""))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_via_task(paths: &Paths) -> Result<(), PlatformError> {
+    let exe = std::env::current_exe().map_err(PlatformError::new)?;
+    let script = paths.dir.join("host.cmd");
+    let mut body = String::from("@echo off\r\n");
+    body.push_str("set \"DESKBRIDGE_DAEMON=1\"\r\n");
+    body.push_str(&format!("set \"DESKBRIDGE_STATE_DIR={}\"\r\n", paths.dir.display()));
+    body.push_str(&format!("cd /d {}\r\n", cmd_quote(&paths.dir.display().to_string())));
+    body.push_str(&cmd_quote(&exe.display().to_string()));
+    for arg in std::env::args().skip(1) {
+        body.push(' ');
+        body.push_str(&cmd_quote(&arg));
+    }
+    body.push_str(" >> ");
+    body.push_str(&cmd_quote(&paths.log.display().to_string()));
+    body.push_str(" 2>&1\r\n");
+    fs::write(&script, body).map_err(PlatformError::new)?;
+    let _ = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&paths.log);
+    let task = "Deskbridge";
+    let tr = cmd_quote(&script.display().to_string());
+    if let Err(detail) = schtasks(&[
+        "/Create",
+        "/F",
+        "/TN",
+        task,
+        "/SC",
+        "ONCE",
+        "/ST",
+        "00:00",
+        "/IT",
+        "/RL",
+        "LIMITED",
+        "/TR",
+        &tr,
+    ]) {
+        return Err(PlatformError::new(format!(
+            "this session cannot capture the screen, and Windows did not schedule the host in the signed-in desktop ({detail}). Log in on the screen and run deskbridge there."
+        )));
+    }
+    if let Err(detail) = schtasks(&["/Run", "/TN", task]) {
+        return Err(PlatformError::new(format!(
+            "Windows scheduled the host but did not start it ({detail}). Log in on the screen and run deskbridge there."
+        )));
+    }
+    wait_until_ready(paths, |_| Ok(true))
+}
+
+#[cfg(target_os = "windows")]
+fn schtasks(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("schtasks")
+        .args(args)
+        .output()
+        .map_err(|err| err.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr);
+    let extra = String::from_utf8_lossy(&output.stdout);
+    let message = format!("{} {}", detail.trim(), extra.trim());
+    let message = message.trim();
+    if message.is_empty() {
+        Err("schtasks failed".to_string())
+    } else {
+        Err(message.to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn cmd_quote(arg: &str) -> String {
+    format!("\"{}\"", arg.replace('"', "\"\""))
+}
+
+#[cfg(target_os = "windows")]
+fn interactive_windows_session() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn ProcessIdToSessionId(pid: u32, session: *mut u32) -> i32;
+        fn WTSGetActiveConsoleSessionId() -> u32;
+        fn GetCurrentProcessId() -> u32;
+    }
+    unsafe {
+        let mut session = 0u32;
+        if ProcessIdToSessionId(GetCurrentProcessId(), &mut session) == 0 {
+            return true;
+        }
+        let console = WTSGetActiveConsoleSessionId();
+        console == 0xFFFF_FFFF || session == console
     }
 }
 

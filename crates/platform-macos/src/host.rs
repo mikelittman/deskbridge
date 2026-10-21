@@ -6,16 +6,17 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use deskbridge_proto::{CodecId, Control, CursorPos, Input, VideoFrame};
-use deskbridge_session::mono_us;
+use deskbridge_proto::{AudioPacket, CodecId, Control, CursorPos, Input, VideoFrame};
+use deskbridge_session::{mono_us, LinkHealth};
 
+use crate::audio::AudioEncoder;
 use crate::capture::{Capture, CapturedFrame, DisplayGeometry};
 use crate::cg::mouse_global;
 use crate::cursor::arrow_shape;
 use crate::encode::Encoder;
 use crate::error::PlatformError;
 use crate::input::Injector;
-use crate::pace::{encode_fps, FramePace};
+use crate::pace::{encode_fps, picture_size, FramePace};
 use crate::preview::{needs_preview, FrameFit, Preview};
 
 pub struct HostOptions {
@@ -30,6 +31,7 @@ pub struct HostOptions {
 pub enum Outbound {
     Control(Control),
     Frame(VideoFrame),
+    Audio(AudioPacket),
 }
 
 pub struct Host {
@@ -40,6 +42,7 @@ pub struct Host {
     input_thread: Option<JoinHandle<()>>,
     video_backlog: Arc<AtomicUsize>,
     viewer_count: Arc<AtomicUsize>,
+    link_health: Arc<LinkHealth>,
 }
 
 impl Host {
@@ -51,10 +54,12 @@ impl Host {
         let force_key = Arc::new(AtomicBool::new(true));
         let video_backlog = Arc::new(AtomicUsize::new(0));
         let viewer_count = Arc::new(AtomicUsize::new(1));
+        let link_health = Arc::new(LinkHealth::new(options.bitrate));
         let stop_flag = Arc::clone(&stop);
         let force_flag = Arc::clone(&force_key);
         let backlog_flag = Arc::clone(&video_backlog);
         let viewers_flag = Arc::clone(&viewer_count);
+        let link_flag = Arc::clone(&link_health);
         let inject = options.inject;
         let input_thread = thread::spawn(move || run_input(inject, geometry_rx, input_rx));
         let thread = thread::spawn(move || {
@@ -67,6 +72,7 @@ impl Host {
                 force_flag,
                 backlog_flag,
                 viewers_flag,
+                link_flag,
             ) {
                 eprintln!("deskbridge host: {err}");
             }
@@ -80,6 +86,7 @@ impl Host {
                 input_thread: Some(input_thread),
                 video_backlog,
                 viewer_count,
+                link_health,
             }),
             Ok(Err(err)) => {
                 let _ = thread.join();
@@ -106,13 +113,17 @@ impl Host {
         self.force_key.store(true, Ordering::Relaxed);
     }
 
-    /// Frames accepted by viewers and not yet written to completion.
+    /// Frames accepted by viewers and not yet acknowledged.
     pub fn video_backlog(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.video_backlog)
     }
 
     pub fn set_viewer_count(&self, count: usize) {
         self.viewer_count.store(count.max(1), Ordering::Relaxed);
+    }
+
+    pub fn link_health(&self) -> Arc<LinkHealth> {
+        Arc::clone(&self.link_health)
     }
 }
 
@@ -172,6 +183,7 @@ fn run(
     force_key: Arc<AtomicBool>,
     video_backlog: Arc<AtomicUsize>,
     viewer_count: Arc<AtomicUsize>,
+    link: Arc<LinkHealth>,
 ) -> Result<(), PlatformError> {
     let capture = match Capture::start(options.display_index, options.resolution) {
         Ok(capture) => capture,
@@ -197,7 +209,7 @@ fn run(
             options.codec,
             capture.info.width,
             capture.info.height,
-            options.bitrate,
+            link.pace_bps(),
             capture.fps,
         ) {
             Ok(encoder) => Some(encoder),
@@ -238,6 +250,9 @@ fn run(
     }
 
     let mut pace = FramePace::new(options.bitrate, capture.fps);
+    let mut shown_pace = options.bitrate;
+    let mut audio_encoder: Option<AudioEncoder> = None;
+    let mut audio_broken = false;
     let mut last_cursor: Option<(i32, i32, bool)> = None;
     // Kept so a viewer who joins a still screen can be sent one keyframe.
     // After that, a still screen sends nothing until the picture changes.
@@ -246,9 +261,23 @@ fn run(
     let mut idle_encode_failed = false;
     let mut encoder_failed = false;
     let mut fit: Option<FrameFit> = None;
-    let target_w = capture.info.width;
-    let target_h = capture.info.height;
+    let mut target_w = capture.info.width;
+    let mut target_h = capture.info.height;
+    let mut spatial = 0u8;
     while !stop.load(Ordering::Relaxed) {
+        let wanted = link.spatial();
+        if wanted != spatial && preview.is_none() {
+            spatial = wanted;
+            let (width, height) = picture_size(capture.info.width, capture.info.height, spatial);
+            if width != target_w || height != target_h {
+                target_w = width;
+                target_h = height;
+                encoder = None;
+                fit = None;
+                force_key.store(true, Ordering::Relaxed);
+                eprintln!("picture {width}x{height} to match the link");
+            }
+        }
         if let Some(frame) = capture.wait_frame(Duration::from_millis(8)) {
             let unchanged = matches!(frame.changed, Some(fraction) if fraction <= 0.0);
             if !unchanged || (latest.is_none() && pending.is_none()) {
@@ -258,7 +287,18 @@ fn run(
 
         let now = Instant::now();
         let viewers = viewer_count.load(Ordering::Relaxed).max(1);
-        let link_busy = video_backlog.load(Ordering::Relaxed) >= viewers;
+        let depth = link.depth().max(1);
+        let link_busy = video_backlog.load(Ordering::Relaxed) >= viewers.saturating_mul(depth);
+        let pace_bps = link.pace_bps();
+        pace.set_bitrate(pace_bps);
+        if shown_pace != 0 && pace_bps.abs_diff(shown_pace) * 4 > shown_pace {
+            eprintln!(
+                "link pace {:.1} Mbps, {} frame(s) in flight",
+                f64::from(pace_bps) / 1_000_000.0,
+                depth
+            );
+        }
+        shown_pace = pace_bps;
         if preview.is_some() {
             if pending.is_some() && !link_busy {
                 let frame = pending.take().expect("pending frame");
@@ -293,9 +333,9 @@ fn run(
         } else if encoder.is_none() && !encoder_failed {
             match Encoder::open(
                 options.codec,
-                capture.info.width,
-                capture.info.height,
-                options.bitrate,
+                target_w,
+                target_h,
+                link.pace_bps(),
                 capture.fps,
             ) {
                 Ok(opened) => encoder = Some(opened),
@@ -315,7 +355,7 @@ fn run(
                     let changed = frame.changed;
                     let capture_us = frame.capture_us;
                     let force = force_key.swap(false, Ordering::Relaxed);
-                    encoder.set_target_fps(encode_fps(capture.fps, changed));
+                    aim_encoder(encoder, capture.fps, changed, link.pace_bps(), options.bitrate);
                     match emit_fitted(
                         encoder,
                         &mut fit,
@@ -349,7 +389,7 @@ fn run(
                         let changed = frame.changed;
                         let force = force_key.swap(false, Ordering::Relaxed);
                         if force {
-                            encoder.set_target_fps(encode_fps(capture.fps, changed));
+                            aim_encoder(encoder, capture.fps, changed, link.pace_bps(), options.bitrate);
                             match emit_fitted(
                                 encoder,
                                 &mut fit,
@@ -373,9 +413,62 @@ fn run(
             }
         }
         publish_cursor(&outbound, capture.geometry, &mut last_cursor);
+        drain_audio(&outbound, &capture, &mut audio_encoder, &mut audio_broken);
     }
     capture.stop();
     Ok(())
+}
+
+fn drain_audio(
+    outbound: &UnboundedSender<Outbound>,
+    capture: &Capture,
+    encoder: &mut Option<AudioEncoder>,
+    broken: &mut bool,
+) {
+    if *broken {
+        return;
+    }
+    let Some(chunk) = capture.take_audio() else {
+        return;
+    };
+    let same = encoder
+        .as_ref()
+        .is_some_and(|encoder| encoder.rate() == chunk.rate && encoder.channels() == chunk.channels);
+    if !same {
+        match AudioEncoder::open(chunk.rate, chunk.channels, 96_000) {
+            Ok(opened) => {
+                eprintln!(
+                    "system audio {} Hz, {} channel(s)",
+                    chunk.rate, chunk.channels
+                );
+                *encoder = Some(opened);
+            }
+            Err(err) => {
+                eprintln!("audio: {err}");
+                *encoder = None;
+                *broken = true;
+                return;
+            }
+        }
+    }
+    let Some(encoder) = encoder.as_mut() else {
+        return;
+    };
+    let capture_us = mono_us();
+    for payload in encoder.push(&chunk.interleaved) {
+        let _ = outbound.send(Outbound::Audio(encoder.packet(payload, capture_us)));
+    }
+}
+
+fn aim_encoder(
+    encoder: &mut Encoder,
+    display_fps: u32,
+    changed: Option<f32>,
+    pace_bps: u32,
+    target_bps: u32,
+) {
+    encoder.set_target_fps(encode_fps(display_fps, changed, pace_bps, target_bps));
+    encoder.set_bitrate(pace_bps);
 }
 
 fn emit_fitted(

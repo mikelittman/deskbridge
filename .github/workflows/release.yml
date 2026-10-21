@@ -44,6 +44,9 @@ jobs:
         run: |
           echo "DESKBRIDGE_VERSION=0.0.${{ github.run_number }}" >> "$GITHUB_ENV"
           echo "DESKBRIDGE_COMMIT=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+      - name: Linux capture libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpipewire-0.3-dev pkg-config libclang-dev
       - name: Build
         shell: bash
         run: cargo build --release --locked -p deskbridge --target ${{ matrix.target }}

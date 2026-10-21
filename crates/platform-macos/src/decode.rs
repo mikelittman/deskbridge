@@ -4,6 +4,17 @@ use std::sync::{Arc, Mutex};
 use apple_cf::cm::{CMBlockBuffer, CMFormatDescription, CMSampleBuffer};
 use apple_cf::cv::CVPixelBuffer;
 use apple_cf::iosurface::IOSurface;
+
+/// A decoded frame. The Metal viewer samples this surface directly.
+pub struct Picture {
+    surface: IOSurface,
+}
+
+impl Picture {
+    pub(crate) fn surface(&self) -> &IOSurface {
+        &self.surface
+    }
+}
 use apple_cf::raw::{
     self, CMVideoFormatDescriptionCreateFromH264ParameterSets,
     CMVideoFormatDescriptionCreateFromHEVCParameterSets, CMSampleBufferCreateReady,
@@ -44,7 +55,7 @@ impl Decoder {
         &mut self,
         config: &CodecConfig,
         frame: &VideoFrame,
-    ) -> Result<Option<IOSurface>, PlatformError> {
+    ) -> Result<Option<Picture>, PlatformError> {
         if frame.payload.is_empty() {
             return Ok(None);
         }
@@ -70,9 +81,9 @@ impl Decoder {
             return Ok(None);
         };
         if let Some(surface) = buffer.io_surface() {
-            return Ok(Some(surface));
+            return Ok(Some(Picture { surface }));
         }
-        copy_to_bgra(&buffer).map(Some)
+        copy_to_bgra(&buffer).map(|surface| Picture { surface }).map(Some)
     }
 }
 

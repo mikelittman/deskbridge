@@ -14,6 +14,12 @@ pub const MAX_CONTROL_PAYLOAD: usize = 8 * 1024 * 1024;
 /// Magic at the start of a video frame stream.
 pub const FRAME_MAGIC: &[u8; 4] = b"DBF1";
 
+/// Magic at the start of an audio packet stream.
+pub const AUDIO_MAGIC: &[u8; 4] = b"DBA1";
+
+/// Fixed prefix of an audio packet, including the magic. The cookie follows.
+pub const AUDIO_PREFIX_LEN: usize = 18;
+
 /// Bytes in a video frame header, excluding the payload.
 pub const FRAME_HEADER_LEN: usize = 4 + 8 + 1 + 1 + 8 + 4;
 
@@ -193,6 +199,52 @@ pub enum Control {
     Pong { client_us: u64, host_us: u64 },
 }
 
+/// One AAC-LC access unit. `cookie` is the encoder's magic cookie, sent with
+/// every packet so a viewer can start at any of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioPacket {
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub capture_us: u64,
+    pub cookie: Vec<u8>,
+    pub payload: Vec<u8>,
+}
+
+impl AudioPacket {
+    pub fn prefix_bytes(&self) -> Result<[u8; AUDIO_PREFIX_LEN], ProtoError> {
+        if self.channels == 0 || self.channels > 2 {
+            return Err(ProtoError::BadLength);
+        }
+        if self.cookie.len() > 64 {
+            return Err(ProtoError::TooLarge(self.cookie.len()));
+        }
+        let mut header = [0u8; AUDIO_PREFIX_LEN];
+        header[0..4].copy_from_slice(AUDIO_MAGIC);
+        header[4..8].copy_from_slice(&self.sample_rate.to_le_bytes());
+        header[8] = self.channels;
+        header[9] = self.cookie.len() as u8;
+        header[10..18].copy_from_slice(&self.capture_us.to_le_bytes());
+        Ok(header)
+    }
+
+    pub fn decode_prefix(header: &[u8; AUDIO_PREFIX_LEN]) -> Result<(u32, u8, u64, u8), ProtoError> {
+        if &header[0..4] != AUDIO_MAGIC {
+            return Err(ProtoError::BadMagic);
+        }
+        let sample_rate = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let channels = header[8];
+        let cookie_len = header[9];
+        if channels == 0 || channels > 2 || cookie_len > 64 {
+            return Err(ProtoError::BadLength);
+        }
+        if !(8_000..=96_000).contains(&sample_rate) {
+            return Err(ProtoError::BadLength);
+        }
+        let capture_us = u64::from_le_bytes(header[10..18].try_into().unwrap());
+        Ok((sample_rate, channels, capture_us, cookie_len))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoFrame {
     pub id: u64,
@@ -227,7 +279,7 @@ impl fmt::Display for ProtoError {
             Self::BadLength => write!(f, "length does not match the payload"),
             Self::TooLarge(n) => write!(f, "message of {n} bytes exceeds the cap"),
             Self::BadUtf8 => write!(f, "string was not utf-8"),
-            Self::BadMagic => write!(f, "video frame magic was not DBF1"),
+            Self::BadMagic => write!(f, "stream magic was not recognized"),
             Self::BadCursor => write!(f, "cursor bitmap size does not match its dimensions"),
             Self::Trailing => write!(f, "bytes left over after a message"),
         }
@@ -817,6 +869,29 @@ mod tests {
         assert_eq!(decoded.codec, CodecId::Hevc);
         assert_eq!(decoded.capture_us, 99);
         assert_eq!(decoded.encode_us, 2500);
+    }
+
+    #[test]
+    fn audio_prefix_roundtrip() {
+        let packet = AudioPacket {
+            sample_rate: 48_000,
+            channels: 2,
+            capture_us: 42,
+            cookie: vec![0x11, 0x90],
+            payload: vec![9, 8, 7],
+        };
+        let prefix = packet.prefix_bytes().unwrap();
+        let (rate, channels, capture_us, cookie_len) = AudioPacket::decode_prefix(&prefix).unwrap();
+        assert_eq!(rate, 48_000);
+        assert_eq!(channels, 2);
+        assert_eq!(capture_us, 42);
+        assert_eq!(cookie_len, 2);
+        assert!(AudioPacket {
+            channels: 0,
+            ..packet
+        }
+        .prefix_bytes()
+        .is_err());
     }
 
     #[test]

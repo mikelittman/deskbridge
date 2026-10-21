@@ -1,5 +1,6 @@
 //! macOS capture, hardware encode and decode, Metal present, and input.
 
+mod audio;
 mod capture;
 mod cg;
 mod pace;
@@ -14,9 +15,10 @@ mod permissions;
 mod present;
 mod preview;
 
+pub use audio::AudioPlayer;
 pub use capture::{Capture, DisplayGeometry};
 pub use codec::{hardware_decode_codecs, hardware_encode_codecs, require_encode_codec};
-pub use decode::Decoder;
+pub use decode::{Decoder, Picture};
 pub use error::PlatformError;
 pub use host::{Host, HostOptions, Outbound};
 pub use permissions::{ensure_host_permissions, PermissionSubject};
@@ -68,8 +70,8 @@ mod tests {
                 saved = Some(config);
             }
             let Some(config) = saved.clone() else { continue };
-            if let Some(surface) = decoder.decode(&config, &packet.frame).expect("decode") {
-                picture = Some(surface);
+            if let Some(decoded) = decoder.decode(&config, &packet.frame).expect("decode") {
+                picture = Some(decoded.surface().clone());
             }
         }
         let picture = picture.expect("decoded picture");

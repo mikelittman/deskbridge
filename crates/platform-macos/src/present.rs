@@ -9,7 +9,10 @@ use screencapturekit::metal::{
     MetalVertexDescriptor, ResourceOptions, SHADER_SOURCE, Uniforms,
 };
 
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
 use crate::cursor::arrow_shape;
+use crate::decode::Picture;
 use crate::error::PlatformError;
 
 const BGRA: u32 = u32::from_be_bytes(*b"BGRA");
@@ -168,6 +171,22 @@ impl Renderer {
         }
     }
 
+    pub fn attach_window(&mut self, window: &winit::window::Window) {
+        let scale = window.scale_factor();
+        let size = window.inner_size();
+        let Ok(handle) = window.window_handle() else {
+            return;
+        };
+        if let RawWindowHandle::AppKit(appkit) = handle.as_raw() {
+            self.attach(
+                appkit.ns_view.as_ptr(),
+                scale,
+                f64::from(size.width),
+                f64::from(size.height),
+            );
+        }
+    }
+
     pub fn attach(&mut self, ns_view: *mut c_void, scale: f64, width: f64, height: f64) {
         self.layer.set_device(&self.device);
         self.layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
@@ -210,7 +229,7 @@ impl Renderer {
 
     pub fn present(
         &mut self,
-        picture: Option<&IOSurface>,
+        picture: Option<&Picture>,
         cursor: Option<CursorDraw>,
         hud: &str,
     ) -> Result<(), PlatformError> {
@@ -219,7 +238,7 @@ impl Renderer {
 
     fn present_in_pool(
         &mut self,
-        picture: Option<&IOSurface>,
+        picture: Option<&Picture>,
         cursor: Option<CursorDraw>,
         hud: &str,
     ) -> Result<(), PlatformError> {
@@ -244,8 +263,8 @@ impl Renderer {
         let encoder = command
             .render_command_encoder(&pass)
             .map_err(PlatformError::new)?;
-        if let Some(surface) = picture {
-            self.draw_picture(&encoder, surface, view_w as f32, view_h as f32)?;
+        if let Some(picture) = picture {
+            self.draw_picture(&encoder, picture.surface(), view_w as f32, view_h as f32)?;
         }
         self.draw_sprites(&encoder, view_w as f32, view_h as f32, cursor)?;
         encoder.end_encoding().map_err(PlatformError::new)?;

@@ -1,22 +1,47 @@
-//! Windows screen capture, encode, and present.
+//! Windows screen capture, encode, present, input, and system audio.
 //!
-//! The 64-bit binary already speaks the Deskbridge protocol. The picture path
-//! is the next piece: Windows.Graphics.Capture for the screen, and Media
-//! Foundation for hardware encode and decode. This crate is where that code lands.
+//! Capture uses Windows.Graphics.Capture. Picture uses Media Foundation
+//! hardware H.264 or HEVC. Sound is a WASAPI loopback of what the machine plays.
 
-/// Shown when `deskbridge host` runs on Windows before capture exists.
-pub const HOST_UNAVAILABLE: &str = "Windows screen capture is not in this build yet. The host backend will use Windows.Graphics.Capture and Media Foundation.";
+#[cfg(target_os = "windows")]
+mod audio;
+#[cfg(target_os = "windows")]
+mod capture;
+#[cfg(target_os = "windows")]
+mod codec;
+#[cfg(target_os = "windows")]
+mod decode;
+#[cfg(target_os = "windows")]
+mod encode;
+#[cfg(target_os = "windows")]
+mod error;
+#[cfg(target_os = "windows")]
+mod host;
+#[cfg(target_os = "windows")]
+mod input;
+#[cfg(target_os = "windows")]
+mod present;
 
-/// Shown when `deskbridge view` runs on Windows before the window exists.
-pub const VIEWER_UNAVAILABLE: &str = "the Windows viewer window is not in this build yet";
+#[cfg(target_os = "windows")]
+pub use audio::AudioPlayer;
+#[cfg(target_os = "windows")]
+pub use codec::{hardware_decode_codecs, hardware_encode_codecs, require_encode_codec};
+#[cfg(target_os = "windows")]
+pub use decode::{Decoder, Picture};
+#[cfg(target_os = "windows")]
+pub use error::PlatformError;
+#[cfg(target_os = "windows")]
+pub use host::{Host, HostOptions, Outbound};
+#[cfg(target_os = "windows")]
+pub use present::{CursorDraw, Renderer};
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_messages_name_the_windows_backend() {
-        assert!(HOST_UNAVAILABLE.contains("Windows.Graphics.Capture"));
-        assert!(VIEWER_UNAVAILABLE.contains("Windows"));
-    }
+#[cfg(target_os = "windows")]
+pub fn ensure_host_permissions(inject: bool) -> Result<(), PlatformError> {
+    host::prepare(inject)
 }
+
+#[cfg(not(target_os = "windows"))]
+mod other;
+
+#[cfg(not(target_os = "windows"))]
+pub use other::*;

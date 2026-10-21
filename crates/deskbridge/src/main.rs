@@ -4,9 +4,9 @@
 ))]
 compile_error!("Linux and Windows builds are 64-bit only");
 
-#[cfg(target_os = "macos")]
+mod keys;
+mod platform;
 mod sessions;
-#[cfg(target_os = "macos")]
 mod view;
 mod daemon;
 mod error;
@@ -17,14 +17,12 @@ use std::time::Duration;
 
 use crate::error::PlatformError;
 use deskbridge_proto::{CodecId, Input};
-use deskbridge_session::{mono_us, parse_public_key_line, AuthorizedKey};
+use deskbridge_session::{
+    listen, mono_us, parse_authorized_file, parse_public_key_line, public_key_line, AuthorizedKey,
+    Identity,
+};
 #[cfg(target_os = "macos")]
-use deskbridge_session::{parse_authorized_file, public_key_line};
-
-#[cfg(target_os = "macos")]
-use deskbridge_platform_macos::{ensure_host_permissions, require_encode_codec, PermissionSubject};
-#[cfg(target_os = "macos")]
-use deskbridge_session::{listen, Identity};
+use deskbridge_platform_macos::{ensure_host_permissions, PermissionSubject};
 
 const DEFAULT_PORT: u16 = 9787;
 
@@ -66,29 +64,7 @@ fn dispatch() -> Result<(), PlatformError> {
 }
 
 fn view_command(args: Vec<String>) -> Result<(), PlatformError> {
-    #[cfg(target_os = "macos")]
-    {
-        view::view(args)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = args;
-        Err(PlatformError::new(deskbridge_platform_linux::VIEWER_UNAVAILABLE))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = args;
-        Err(PlatformError::new(
-            deskbridge_platform_windows::VIEWER_UNAVAILABLE,
-        ))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        let _ = args;
-        Err(PlatformError::new(
-            "the viewer is not built for this operating system",
-        ))
-    }
+    view::view(args)
 }
 
 fn print_help() {
@@ -103,7 +79,7 @@ deskbridge version
 Direct connection only. Default port is {DEFAULT_PORT}. The host listens on every interface.
 The host prints a pairing code. Ctrl+Alt releases the viewer's pointer grab.
 --daemon keeps the host running after the terminal closes.
-From SSH, --daemon starts the host in the desktop session so Screen Recording applies to deskbridge. Log in on the Mac's screen first.
+From a shell that is not the desktop session, --daemon starts the host there: launchd on macOS, a systemd user service on Linux, and a signed-in user task on Windows. Log in on the screen first.
 `deskbridge status` prints the pairing code. `deskbridge stop` ends that host.
 --key on the host authorizes an ssh-ed25519 public key. Repeat it for more than one.
 --github USER authorizes the ssh-ed25519 keys published for that GitHub account.
@@ -114,7 +90,8 @@ On the viewer, --resolution selects that viewer's picture size. On the host, it 
 With several viewers, the picture fits the smallest request.
 The host keeps listening after a viewer disconnects. Several viewers can connect at once.
 The first picture is small so it shows up quickly, then the full picture follows.
-The frame rate drops when a large part of the screen is changing, so input stays responsive.
+A fast link runs at the full frame rate. A slow link lowers the frame rate, bitrate, and picture size so the view stays current.
+The viewer plays the host's system audio.
 Quitting the host, or deskbridge stop, closes every viewer."
     );
 }
@@ -132,51 +109,36 @@ struct HostArgs {
 
 fn host(args: Vec<String>) -> Result<(), PlatformError> {
     let args = parse_host(&args)?;
-    #[cfg(target_os = "macos")]
-    {
-        if args.daemon && !daemon::is_child() {
-            // An SSH parent must not prompt. macOS would attach the grant to sshd.
-            if !daemon::needs_gui_launch() {
-                ensure_host_permissions(args.inject, PermissionSubject::Terminal)
-                    .map_err(PlatformError::new)?;
-            }
-            return daemon::spawn();
+    if args.daemon && !daemon::is_child() {
+        // An SSH parent must not prompt. macOS would attach the grant to sshd.
+        #[cfg(target_os = "macos")]
+        if !daemon::needs_gui_launch() {
+            ensure_host_permissions(args.inject, PermissionSubject::Terminal)
+                .map_err(PlatformError::new)?;
         }
-        return run_host(args);
+        return daemon::spawn();
     }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = args;
-        Err(PlatformError::new(deskbridge_platform_linux::HOST_UNAVAILABLE))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = args;
-        Err(PlatformError::new(deskbridge_platform_windows::HOST_UNAVAILABLE))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        let _ = args;
-        Err(PlatformError::new(
-            "the host is not built for this operating system",
-        ))
-    }
+    run_host(args)
 }
 
-#[cfg(target_os = "macos")]
 fn run_host(args: HostArgs) -> Result<(), PlatformError> {
     let session_files = if daemon::is_child() {
         Some(daemon::prepare_child()?)
     } else {
         None
     };
-    let subject = if std::env::var_os("DESKBRIDGE_LAUNCHD").is_some() {
-        PermissionSubject::ThisBinary
-    } else {
-        PermissionSubject::Terminal
-    };
-    ensure_host_permissions(args.inject, subject).map_err(PlatformError::new)?;
-    let codecs = require_encode_codec().map_err(PlatformError::new)?;
+    #[cfg(target_os = "macos")]
+    {
+        let subject = if std::env::var_os("DESKBRIDGE_LAUNCHD").is_some() {
+            PermissionSubject::ThisBinary
+        } else {
+            PermissionSubject::Terminal
+        };
+        ensure_host_permissions(args.inject, subject).map_err(PlatformError::new)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    crate::platform::ensure_host_permissions(args.inject).map_err(PlatformError::new)?;
+    let codecs = crate::platform::require_encode_codec().map_err(PlatformError::new)?;
     let identity = Identity::generate().map_err(PlatformError::new)?;
     let authorized = authorized_keys(args.keys, &args.github)?;
     println!("pairing code: {}", identity.code);
@@ -187,7 +149,7 @@ fn run_host(args: HostArgs) -> Result<(), PlatformError> {
     }
     print_listen(&args.listen);
     if !args.inject {
-        println!("input injection is off. Pass --inject to drive this Mac.");
+        println!("input injection is off. Pass --inject to drive the host.");
     }
     if let Some((width, height)) = args.resolution {
         println!("resolution limit {width}x{height} (keeps aspect, never larger than the display)");
@@ -350,7 +312,6 @@ fn is_other_ssh_key(line: &str) -> bool {
     })
 }
 
-#[cfg(target_os = "macos")]
 fn authorized_keys(
     from_flags: Vec<AuthorizedKey>,
     github_users: &[String],
@@ -382,7 +343,6 @@ fn authorized_keys(
     Ok(keys)
 }
 
-#[cfg(target_os = "macos")]
 fn push_unique(keys: &mut Vec<AuthorizedKey>, key: AuthorizedKey) {
     if keys.iter().any(|have| have.blob == key.blob) {
         return;
@@ -390,7 +350,6 @@ fn push_unique(keys: &mut Vec<AuthorizedKey>, key: AuthorizedKey) {
     keys.push(key);
 }
 
-#[cfg(target_os = "macos")]
 fn fetch_github_keys(user: &str) -> Result<GithubKeySet, PlatformError> {
     use std::io::Read;
 
@@ -426,7 +385,6 @@ fn fetch_github_keys(user: &str) -> Result<GithubKeySet, PlatformError> {
     keys_from_github_text(user, &text)
 }
 
-#[cfg(target_os = "macos")]
 fn read_authorized_keys_file() -> Result<Vec<AuthorizedKey>, PlatformError> {
     let paths = daemon::paths()?;
     let file = paths.dir.join("authorized_keys");
@@ -551,7 +509,6 @@ pub fn resolve_socket(text: &str) -> Result<SocketAddr, PlatformError> {
         .ok_or_else(|| PlatformError::new(format!("could not resolve {text}")))
 }
 
-#[cfg(target_os = "macos")]
 pub fn modifiers_from_winit(state: winit::keyboard::ModifiersState) -> u8 {
     use deskbridge_proto::mods;
     let mut bits = 0;

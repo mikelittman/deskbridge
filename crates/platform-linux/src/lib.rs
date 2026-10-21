@@ -1,22 +1,48 @@
-//! Linux screen capture, encode, and present.
+//! Linux screen capture, encode, present, input, and system audio.
 //!
-//! The 64-bit binary already speaks the Deskbridge protocol. The picture path
-//! is the next piece: PipeWire (or X11) for the screen, and VAAPI or OpenH264
-//! for the encoded frames. This crate is where that code lands.
+//! On a desktop this uses the XDG remote-desktop portal and PipeWire, with
+//! VA-API for hardware H.264 or HEVC. X11 is the fallback when the portal is
+//! not there.
 
-/// Shown when `deskbridge host` runs on Linux before capture exists.
-pub const HOST_UNAVAILABLE: &str = "Linux screen capture is not in this build yet. The host backend will use PipeWire or X11, with VAAPI or OpenH264.";
+#[cfg(target_os = "linux")]
+mod audio;
+#[cfg(target_os = "linux")]
+mod capture;
+#[cfg(target_os = "linux")]
+mod codec;
+#[cfg(target_os = "linux")]
+mod decode;
+#[cfg(target_os = "linux")]
+mod encode;
+#[cfg(target_os = "linux")]
+mod error;
+#[cfg(target_os = "linux")]
+mod host;
+#[cfg(target_os = "linux")]
+mod input;
+#[cfg(target_os = "linux")]
+mod present;
 
-/// Shown when `deskbridge view` runs on Linux before the window exists.
-pub const VIEWER_UNAVAILABLE: &str = "the Linux viewer window is not in this build yet";
+#[cfg(target_os = "linux")]
+pub use audio::AudioPlayer;
+#[cfg(target_os = "linux")]
+pub use codec::{hardware_decode_codecs, hardware_encode_codecs, require_encode_codec};
+#[cfg(target_os = "linux")]
+pub use decode::{Decoder, Picture};
+#[cfg(target_os = "linux")]
+pub use error::PlatformError;
+#[cfg(target_os = "linux")]
+pub use host::{Host, HostOptions, Outbound};
+#[cfg(target_os = "linux")]
+pub use present::{CursorDraw, Renderer};
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_messages_name_the_linux_backend() {
-        assert!(HOST_UNAVAILABLE.contains("PipeWire"));
-        assert!(VIEWER_UNAVAILABLE.contains("Linux"));
-    }
+#[cfg(target_os = "linux")]
+pub fn ensure_host_permissions(inject: bool) -> Result<(), PlatformError> {
+    host::prepare(inject)
 }
+
+#[cfg(not(target_os = "linux"))]
+mod other;
+
+#[cfg(not(target_os = "linux"))]
+pub use other::*;

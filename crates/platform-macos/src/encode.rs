@@ -6,14 +6,14 @@ use videotoolbox::compression::{
     CompressionSession, FrameProperties, HardwareAcceleration,
 };
 use videotoolbox::ffi::{
-    kCFAllocatorDefault, kCFNumberFloat64Type, kVTCompressionPropertyKey_ExpectedFrameRate,
+    kCFAllocatorDefault, kCFNumberFloat64Type, kCFNumberSInt32Type,
+    kVTCompressionPropertyKey_AverageBitRate, kVTCompressionPropertyKey_ExpectedFrameRate,
     kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, CFNumberCreate, CFRelease,
 };
 use videotoolbox::VTError;
 
 use crate::codec::vt_codec;
 use crate::error::PlatformError;
-use crate::pace::encode_fps;
 
 const MAX_KEYFRAME_INTERVAL: i32 = 3600;
 
@@ -30,6 +30,7 @@ pub struct Encoder {
     /// Timescale for frame timestamps. Stays at the capture rate.
     fps: u32,
     target_fps: u32,
+    bitrate: u32,
     next_id: u64,
     parameter_sets: Vec<Vec<u8>>,
     nal_length_size: u8,
@@ -44,6 +45,7 @@ impl Encoder {
         fps: u32,
     ) -> Result<Self, PlatformError> {
         let fps = fps.clamp(1, 240);
+        let bitrate = bitrate.max(1);
         let session = open_session(codec, width, height, bitrate, fps)?;
         confirm_hardware(&session)?;
         Ok(Self {
@@ -52,7 +54,8 @@ impl Encoder {
             width,
             height,
             fps,
-            target_fps: encode_fps(fps, None),
+            target_fps: fps.clamp(1, 60),
+            bitrate,
             next_id: 1,
             parameter_sets: Vec::new(),
             nal_length_size: 4,
@@ -84,6 +87,36 @@ impl Encoder {
         unsafe { CFRelease(number.cast()) };
         if result.is_ok() {
             self.target_fps = fps;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Bits per second for the frames that follow. An unchanged value does nothing.
+    pub fn set_bitrate(&mut self, bitrate: u32) -> bool {
+        let bitrate = bitrate.max(1);
+        if bitrate == self.bitrate {
+            return true;
+        }
+        let value = i32::try_from(bitrate).unwrap_or(i32::MAX);
+        let number = unsafe {
+            CFNumberCreate(
+                kCFAllocatorDefault,
+                kCFNumberSInt32Type,
+                std::ptr::from_ref(&value).cast(),
+            )
+        };
+        if number.is_null() {
+            return false;
+        }
+        let result = unsafe {
+            self.session
+                .set_property(kVTCompressionPropertyKey_AverageBitRate, number.cast())
+        };
+        unsafe { CFRelease(number.cast()) };
+        if result.is_ok() {
+            self.bitrate = bitrate;
             true
         } else {
             false
@@ -161,7 +194,7 @@ fn open_session(
             .with_allow_frame_reordering(false)
             .with_hardware_acceleration(HardwareAcceleration::Required)
             .with_average_bit_rate(bitrate)
-            .with_expected_frame_rate(f64::from(encode_fps(fps, None)))
+            .with_expected_frame_rate(f64::from(fps.clamp(1, 60)))
             .with_max_keyframe_interval(MAX_KEYFRAME_INTERVAL);
         if low_latency {
             builder = builder.with_low_latency_rate_control(true);

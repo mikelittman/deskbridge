@@ -7,3 +7,15 @@ publish.workspace = true
 description = "Deskbridge Linux host and viewer backend"
 
 [dependencies]
+deskbridge-proto = { path = "../proto" }
+deskbridge-session = { path = "../session" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = "0.11"
+fdk-aac = "0.8"
+futures-util = "0.3"
+libloading = "0.8"
+pipewire = "0.8"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+wgpu = "24"
+winit = "0.30"

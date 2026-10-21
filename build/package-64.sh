@@ -17,7 +17,7 @@ docker run --platform linux/amd64 --rm \
     set -eu
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 ca-certificates
+    apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 ca-certificates pkg-config libpipewire-0.3-dev libclang-dev
     rustup target add x86_64-unknown-linux-gnu x86_64-pc-windows-gnu
     export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
     cargo build --locked --release --target x86_64-unknown-linux-gnu -p deskbridge

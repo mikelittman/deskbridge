@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use deskbridge_platform_macos::{hardware_decode_codecs, CursorDraw, Decoder, Renderer};
+use crate::platform::{hardware_decode_codecs, AudioPlayer, CursorDraw, Decoder, Picture, Renderer};
 
 use crate::error::PlatformError;
 use deskbridge_proto::{CodecConfig, CodecId, Control, CursorPos, DisplayInfo, Input, MouseButton};
@@ -13,8 +13,8 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+#[cfg(target_os = "macos")]
 use winit::platform::scancode::PhysicalKeyExtScancode;
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::{parse_bitrate, resolve_targets, Latency};
@@ -73,7 +73,8 @@ pub fn view(args: Vec<String>) -> Result<(), PlatformError> {
         config: None,
         previous_config: None,
         decoder: Decoder::new(),
-        picture: None,
+        speaker: AudioPlayer::new(),
+        picture: None::<Picture>,
         codec: None,
         latency: Latency::new(),
         dirty: true,
@@ -198,7 +199,8 @@ struct Viewer {
     config: Option<CodecConfig>,
     previous_config: Option<CodecConfig>,
     decoder: Decoder,
-    picture: Option<apple_cf::iosurface::IOSurface>,
+    speaker: AudioPlayer,
+    picture: Option<Picture>,
     codec: Option<CodecId>,
     latency: Latency,
     dirty: bool,
@@ -241,6 +243,9 @@ impl Viewer {
         }
         if self.ended.is_some() {
             return true;
+        }
+        while let Some(packet) = self.client.audio.try_recv() {
+            self.speaker.push(&packet);
         }
         if let Some(frame) = self.client.frames.try_recv() {
             if self.config.is_none() {
@@ -367,7 +372,7 @@ impl Viewer {
 
     /// Decode with the current codec config. A frame that belongs to the previous
     /// picture still decodes, so the full-frame config cannot blank the first picture.
-    fn decode_frame(&mut self, frame: &deskbridge_proto::VideoFrame) -> Option<apple_cf::iosurface::IOSurface> {
+    fn decode_frame(&mut self, frame: &deskbridge_proto::VideoFrame) -> Option<Picture> {
         let config = self.config.clone()?;
         match self.decoder.decode(&config, frame) {
             Ok(Some(surface)) => return Some(surface),
@@ -426,16 +431,8 @@ impl ApplicationHandler for Viewer {
             .expect("window");
         let scale = window.scale_factor();
         let size = window.inner_size();
-        if let Ok(handle) = window.window_handle() {
-            if let RawWindowHandle::AppKit(appkit) = handle.as_raw() {
-                self.renderer.attach(
-                    appkit.ns_view.as_ptr(),
-                    scale,
-                    f64::from(size.width),
-                    f64::from(size.height),
-                );
-            }
-        }
+        let _ = (scale, size);
+        self.renderer.attach_window(&window);
         self.window = Some(window);
         self.dirty = true;
     }
@@ -518,10 +515,9 @@ impl ApplicationHandler for Viewer {
                 if !self.grabbed {
                     return;
                 }
-                let Some(code) = event.physical_key.to_scancode() else {
+                let Some(code) = wire_key(&event.physical_key) else {
                     return;
                 };
-                let code = u16::try_from(code).unwrap_or(0);
                 self.client.send_control(Control::Input(Input::Key {
                     code,
                     down: event.state == ElementState::Pressed,
@@ -599,6 +595,23 @@ pub(crate) fn scale_axis(value: i32, from: u32, to: u32) -> i32 {
         return value;
     }
     (i64::from(value).saturating_mul(i64::from(to)) / i64::from(from)) as i32
+}
+
+fn wire_key(key: &winit::keyboard::PhysicalKey) -> Option<u16> {
+    if let winit::keyboard::PhysicalKey::Code(code) = *key {
+        if let Some(mac) = crate::keys::mac_key(code) {
+            return Some(mac);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return key.to_scancode().and_then(|code| u16::try_from(code).ok());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = key;
+        None
+    }
 }
 
 fn mouse_button(button: winit::event::MouseButton) -> Option<MouseButton> {

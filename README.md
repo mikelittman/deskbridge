@@ -1,12 +1,12 @@
 # Deskbridge
 
-Deskbridge is a small remote desktop. One binary is both the host and the viewer. The host captures a Mac screen, encodes it with hardware HEVC when the Mac has that encoder and hardware H.264 otherwise, and sends the picture over a direct UDP connection. You connect with an IP address, a hostname, or a VPN you already run, such as Tailscale or WireGuard.
+Deskbridge is a small remote desktop. One binary is both the host and the viewer. The host captures the screen of a Mac, a Linux desktop, or a Windows desktop, encodes it with hardware HEVC when that machine has the encoder and hardware H.264 otherwise, and sends the picture over a direct UDP connection. You connect with an IP address, a hostname, or a VPN you already run, such as Tailscale or WireGuard.
 
-A still screen sends nothing. When the picture is moving, the host spends the bitrate on the part of the screen that is changing and slows the frame rate when a large area is in motion, so the pointer stays responsive. The cursor is drawn as a sprite on top of the picture.
+A still screen sends nothing. On a fast link the picture stays at the full frame rate and the bitrate you set. On a slow link the frame rate and bitrate drop, and the picture gets smaller if that is what keeps the view current. The cursor is drawn as a sprite on top of the picture. The viewer plays the host's system audio.
 
 ## Features
 
-- macOS host and macOS viewer in one binary, about 4 MB
+- Host and viewer in one binary on macOS, Linux, and Windows
 - Hardware HEVC, with hardware H.264 when HEVC is unavailable
 - Direct connection on UDP port 9787. No account server and no relay
 - Pairing code, or SSH keys from an agent (including 1Password) and from a GitHub account
@@ -14,17 +14,20 @@ A still screen sends nothing. When the picture is moving, the host spends the bi
 - The host keeps listening after a viewer disconnects
 - Optional background host (`--daemon`)
 - Viewer-selected picture size (`--resolution`)
+- Host system audio on the viewer
 
-Audio, clipboard sync, file transfer, and multiple monitors are not in this version.
+Clipboard sync, file transfer, and multiple monitors are not in this version.
 
 ## Requirements
 
-- macOS on both machines. The host is the Mac whose screen you want to see.
+- The host and the viewer can each be macOS, Linux, or Windows. The host is the machine whose screen you want to see.
 - A Rust toolchain (`rustup`, stable) to build from source.
-- Screen Recording permission on the host. `--inject` also needs Accessibility, so the viewer’s mouse and keyboard can drive the host.
+- On macOS, Screen Recording permission on the host. `--inject` also needs Accessibility.
+- On Linux, a logged-in desktop (Wayland or X11) with PipeWire. The portal asks before capture. Hardware H.264 or HEVC through VA-API. `libpipewire` is required to start the binary.
+- On Windows, a signed-in desktop session. Hardware H.264 or HEVC through Media Foundation. Capture uses Windows.Graphics.Capture.
 - UDP port 9787 reachable from the viewer to the host.
 
-Linux and Windows builds of the binary exist for the command-line tools. Capture and the viewer window are macOS-only.
+A machine without a hardware H.264 or HEVC encoder cannot host. The viewer plays the host's system audio on each of these systems.
 
 ## Build
 
@@ -133,7 +136,9 @@ deskbridge stop
 
 ### Picture size and bitrate
 
-`--bitrate` accepts `20M`, `500k`, or a raw bit count. The default is 20 Mbps. The host sends the next frame only as fast as the link and that budget can carry. The first picture is small so a slow link shows the desktop quickly. The full picture follows. A small change stays sharp. A large change lowers the frame rate so that region keeps its detail.
+`--bitrate` accepts `20M`, `500k`, or a raw bit count. The default is 20 Mbps, and that is the quality a fast link aims for. On a fast link the picture runs at the display frame rate, including while a large area of the screen is changing, and the host keeps enough frames in flight to cover the round trip. On a slow link it keeps a single frame in flight, lowers the bitrate and the frame rate, and sends a smaller picture if the link stays slow, so the desktop you see stays as current as the path allows. The first picture is small so a slow link shows the desktop quickly. The full picture follows. A small change stays sharp.
+
+The viewer plays the host's system audio. Sound is AAC at about 96 kbps and is sent ahead of the picture, so a slow link shrinks the video before it crowds out the audio. A quiet host still sends that stream while a viewer is connected.
 
 `--resolution` accepts `720p`, `1080p`, `1440p`, `2160p`, `4k`, or `1280x720`. On the viewer it is the picture size that viewer wants, often the client screen:
 
@@ -151,7 +156,7 @@ system_profiler SPDisplaysDataType | awk '/Resolution:/ {print}'
 
 ### Several viewers
 
-The pairing code stays the same until the host process exits. The host keeps listening after a viewer disconnects. Run `deskbridge view` again to reconnect. Viewers share one capture. Each viewer’s mouse and keyboard is injected when `--inject` is on. The cursor on the picture is the host Mac’s cursor. When the last viewer leaves, capture stops until the next connection.
+The pairing code stays the same until the host process exits. The host keeps listening after a viewer disconnects. Run `deskbridge view` again to reconnect. Viewers share one capture. Each viewer’s mouse and keyboard is injected when `--inject` is on. The cursor on the picture is the host’s cursor. When the last viewer leaves, capture stops until the next connection.
 
 Quitting the host, Ctrl+C, or `deskbridge stop` closes every viewer. If the host process is killed, each viewer closes after the connection times out, about 10 seconds.
 
@@ -163,7 +168,7 @@ deskbridge host --daemon --inject
 
 The command prints the pairing code and returns. The host keeps running after the terminal closes. `deskbridge status` prints the code again. `deskbridge stop` ends the host and closes every viewer.
 
-From an SSH session, `--daemon` starts the host in the Mac’s desktop session, so Screen Recording applies to the `deskbridge` program. Log in on the Mac’s screen first. The permission prompt appears there.
+From a shell that is not the desktop session, `--daemon` starts the host in that session. On macOS it uses a launchd GUI job, so Screen Recording applies to the `deskbridge` program and the permission prompt appears on the Mac’s screen. On Linux it starts a systemd user service. On Windows it runs a task in the signed-in user session. Log in on the screen first.
 
 State files (pid, pairing code, log) live in:
 
@@ -220,8 +225,8 @@ If the viewer prints `timed out`, the host is not receiving packets. Confirm the
 | `crates/proto` | Wire messages |
 | `crates/session` | QUIC session, pairing, SSH authentication |
 | `crates/platform-macos` | ScreenCaptureKit, VideoToolbox, window, input |
-| `crates/platform-linux` | Linux command-line stubs |
-| `crates/platform-windows` | Windows command-line stubs |
+| `crates/platform-linux` | PipeWire, VA-API, portal input, viewer window |
+| `crates/platform-windows` | Windows.Graphics.Capture, Media Foundation, WASAPI, viewer window |
 
 ## License
 
