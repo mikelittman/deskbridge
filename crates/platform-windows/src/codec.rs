@@ -23,20 +23,13 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
+use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
 
 use deskbridge_proto::CodecId;
 
 use crate::error::PlatformError;
 
 const RPC_E_CHANGED_MODE: HRESULT = HRESULT(0x80010106u32 as i32);
-
-#[link(name = "combase")]
-extern "system" {
-    fn RoInitialize(init_type: i32) -> HRESULT;
-    fn RoUninitialize();
-}
-
-const RO_INIT_MULTITHREADED: i32 = 1;
 
 /// Keeps Media Foundation started for as long as an encoder, decoder, or probe holds it.
 pub(crate) struct MfGuard {
@@ -54,13 +47,10 @@ impl MfGuard {
         } else {
             return Err(PlatformError::new(format!("COM did not start ({})", hr.0)));
         };
-        let winrt_hr = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
-        let winrt = if winrt_hr.is_ok() {
-            true
-        } else if winrt_hr == RPC_E_CHANGED_MODE {
-            false
-        } else {
-            false
+        let winrt = match unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+            Ok(()) => true,
+            Err(err) if err.code() == RPC_E_CHANGED_MODE => false,
+            Err(_) => false,
         };
         if let Err(err) = unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) } {
             if com {
