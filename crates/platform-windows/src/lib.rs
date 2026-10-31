@@ -20,6 +20,8 @@ mod host;
 #[cfg(target_os = "windows")]
 mod input;
 #[cfg(target_os = "windows")]
+mod firewall;
+#[cfg(target_os = "windows")]
 mod present;
 
 #[cfg(target_os = "windows")]
@@ -38,6 +40,11 @@ pub use present::{CursorDraw, Renderer};
 #[cfg(target_os = "windows")]
 pub fn ensure_host_permissions(inject: bool) -> Result<(), PlatformError> {
     host::prepare(inject)
+}
+
+#[cfg(target_os = "windows")]
+pub fn allow_incoming(port: u16) {
+    firewall::allow_incoming(port)
 }
 
 #[cfg(not(target_os = "windows"))]

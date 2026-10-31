@@ -215,7 +215,7 @@ The host checks permissions before it listens.
 
 If a permission is off, the host opens the system prompt and exits. macOS applies the grant on the next launch, so start the host again after turning it on. From Terminal, the grant belongs to that terminal app. From SSH with `--daemon`, the grant belongs to the `deskbridge` program, and the prompt is on the Mac’s screen.
 
-If the viewer prints `timed out`, the host is not receiving packets. Confirm the host log says it is listening on every interface, and allow incoming UDP 9787.
+If the viewer prints `timed out`, the host is not receiving packets. Confirm the host log says it is listening on every interface, and allow incoming UDP 9787. On Windows the host adds that firewall rule when it is allowed to; otherwise allow `deskbridge.exe` in Windows Defender Firewall. A Windows host listens on IPv4 and IPv6.
 
 ## Project layout
 

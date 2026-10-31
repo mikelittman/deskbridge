@@ -113,7 +113,7 @@ async fn connect_first(
         }
     }
     Err(PlatformError::new(format!(
-        "could not reach the host\n{}\nThe host must be running. A host started without --listen only accepted 127.0.0.1; restart it with --listen [::]:9787",
+        "could not reach the host\n{}\nThe host must be running and able to receive UDP. On Windows, allow deskbridge in Windows Defender Firewall.",
         failures.join("\n")
     )))
 }

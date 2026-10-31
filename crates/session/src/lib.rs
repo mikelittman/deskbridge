@@ -21,7 +21,10 @@ use std::time::Duration;
 use deskbridge_proto::{AudioPacket, CodecId, Control, Framer, VideoFrame, AUDIO_MAGIC, AUDIO_PREFIX_LEN, FRAME_MAGIC, PROTOCOL_VERSION};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 pub use quinn::Endpoint;
-use quinn::{ClientConfig, Connection, RecvStream, SendStream, ServerConfig, TransportConfig, VarInt};
+use quinn::{
+    default_runtime, ClientConfig, Connection, EndpointConfig, RecvStream, SendStream, ServerConfig,
+    TransportConfig, VarInt,
+};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -554,7 +557,24 @@ pub fn listen(addr: SocketAddr, identity: &Identity) -> Result<Endpoint, Session
     let quic = QuicServerConfig::try_from(crypto).map_err(SessionError::new)?;
     let mut server = ServerConfig::with_crypto(Arc::new(quic));
     server.transport_config(transport());
-    Endpoint::server(server, addr).map_err(SessionError::new)
+    let socket = bind_udp(addr).map_err(SessionError::new)?;
+    let runtime = default_runtime().ok_or_else(|| SessionError::new("no async runtime for the host socket"))?;
+    Endpoint::new(EndpointConfig::default(), Some(server), socket, runtime).map_err(SessionError::new)
+}
+
+/// A wildcard IPv6 socket also accepts IPv4. Windows leaves IPv6-only on unless asked.
+fn bind_udp(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let domain = if addr.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
 }
 
 /// Stop accepting and close every connection on this endpoint.
@@ -1166,6 +1186,29 @@ impl ServerCertVerifier for PinVerifier {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+    use std::time::Duration;
+
+    use super::bind_udp;
+
+    #[test]
+    fn a_wildcard_ipv6_socket_receives_ipv4() {
+        let listener = bind_udp(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))).unwrap();
+        listener.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        sender
+            .send_to(b"hi", SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+            .unwrap();
+        let mut buf = [0u8; 8];
+        let (n, from) = listener.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hi");
+        assert!(from.ip().to_canonical().is_ipv4());
     }
 }
 

@@ -138,6 +138,8 @@ fn run_host(args: HostArgs) -> Result<(), PlatformError> {
     }
     #[cfg(not(target_os = "macos"))]
     crate::platform::ensure_host_permissions(args.inject).map_err(PlatformError::new)?;
+    #[cfg(target_os = "windows")]
+    crate::platform::allow_incoming(args.listen.port());
     let codecs = crate::platform::require_encode_codec().map_err(PlatformError::new)?;
     let identity = Identity::generate().map_err(PlatformError::new)?;
     let authorized = authorized_keys(args.keys, &args.github)?;
