@@ -1,14 +1,18 @@
 use std::mem::ManuallyDrop;
+use std::thread;
+use std::time::Duration;
 
 use windows::core::{Interface, VARIANT};
 use windows::Win32::Media::MediaFoundation::{
-    IMFSample, IMFTransform, MFSampleExtension_CleanPoint, MFVideoInterlace_Progressive, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_E_TRANSFORM_STREAM_CHANGE, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
-    MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
-    CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncVideoForceKeyFrame,
-    CODECAPI_AVLowLatencyMode, ICodecAPI, eAVEncCommonRateControlMode_CBR,
+    IMFMediaEventGenerator, IMFSample, IMFTransform, MFSampleExtension_CleanPoint, MFVideoInterlace_Progressive,
+    METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_NOTACCEPTING,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_SUBTYPE,
+    MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MFT_CATEGORY_VIDEO_ENCODER, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
+    CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI,
+    eAVEncCommonRateControlMode_CBR,
 };
 
 use deskbridge_proto::{CodecConfig, CodecId, VideoFrame};
@@ -39,6 +43,8 @@ pub struct Encoder {
     layout: PixelLayout,
     provides_samples: bool,
     output_bytes: u32,
+    events: Option<IMFMediaEventGenerator>,
+    held: Option<(Vec<u8>, bool)>,
     next_id: u64,
     parameter_sets: Vec<Vec<u8>>,
     _mf: MfGuard,
@@ -84,6 +90,13 @@ impl Encoder {
         let info = unsafe { transform.GetOutputStreamInfo(0) }.map_err(PlatformError::new)?;
         let provides_samples = info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
         let output_bytes = info.cbSize.max(256 * 1024).min(8 * 1024 * 1024);
+        // Hardware encoders are asynchronous. ProcessInput before METransformNeedInput
+        // returns MF_E_NOTACCEPTING: "The callee is currently not accepting further input."
+        let events = if is_async(&transform) {
+            transform.cast::<IMFMediaEventGenerator>().ok()
+        } else {
+            None
+        };
         Ok(Self {
             transform,
             codec_api,
@@ -95,6 +108,8 @@ impl Encoder {
             layout,
             provides_samples,
             output_bytes,
+            events,
+            held: None,
             next_id: 1,
             parameter_sets: Vec::new(),
             _mf: mf,
@@ -172,9 +187,14 @@ impl Encoder {
         unsafe {
             sample.SetSampleTime(when).ok();
             sample.SetSampleDuration(tick).ok();
-            self.transform.ProcessInput(0, &sample, 0).map_err(PlatformError::new)?;
         }
-        let Some((bytes, clean)) = self.drain_output()? else {
+        self.submit(&sample)?;
+        let produced = if let Some(saved) = self.held.take() {
+            Some(saved)
+        } else {
+            self.drain_output()?
+        };
+        let Some((bytes, clean)) = produced else {
             return Ok(None);
         };
         let nals = payload_nals(self.codec, &bytes);
@@ -262,7 +282,7 @@ impl Encoder {
                         }
                     }
                 }
-                Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
+                Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT || err.code() == MF_E_NOTACCEPTING => break,
                 Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                     if let Ok(next) = unsafe { self.transform.GetOutputAvailableType(0, 0) } {
                         unsafe { self.transform.SetOutputType(0, &next, 0).ok() };
@@ -273,6 +293,56 @@ impl Encoder {
         }
         Ok(produced)
     }
+
+    fn submit(&mut self, sample: &IMFSample) -> Result<(), PlatformError> {
+        for _ in 0..4 {
+            if self.events.is_some() {
+                self.wait_until_input_wanted();
+            }
+            match unsafe { self.transform.ProcessInput(0, sample, 0) } {
+                Ok(()) => return Ok(()),
+                Err(err) if err.code() == MF_E_NOTACCEPTING => {
+                    let _ = self.drain_output()?;
+                }
+                Err(err) => return Err(PlatformError::new(err)),
+            }
+        }
+        Err(PlatformError::new(
+            "encoder is not accepting frames. The hardware encoder did not ask for input.",
+        ))
+    }
+
+    fn wait_until_input_wanted(&mut self) {
+        let Some(events) = self.events.clone() else {
+            return;
+        };
+        for _ in 0..40 {
+            match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                Ok(event) => {
+                    let kind = unsafe { event.GetType() }.unwrap_or(0);
+                    if kind == METransformNeedInput.0 as u32 {
+                        return;
+                    }
+                    if kind == METransformHaveOutput.0 as u32 && self.held.is_none() {
+                        if let Ok(Some(packet)) = self.drain_output() {
+                            self.held = Some(packet);
+                        }
+                    }
+                }
+                Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => return,
+            }
+        }
+    }
+}
+
+fn is_async(transform: &IMFTransform) -> bool {
+    unsafe { transform.GetAttributes() }
+        .ok()
+        .and_then(|attrs| unsafe { attrs.GetUINT32(&MF_TRANSFORM_ASYNC) }.ok())
+        == Some(1)
 }
 
 fn clean_point(sample: &IMFSample) -> bool {
