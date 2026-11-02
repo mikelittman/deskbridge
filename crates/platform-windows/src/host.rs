@@ -314,6 +314,9 @@ fn run(
                     force_key.store(true, Ordering::Relaxed);
                 }
                 None => {
+                    // The encoder accepted the frame and has not produced one yet.
+                    // Keep it, or the picture that is in flight is thrown away.
+                    preview_encoder = Some((preview, width, height));
                     pending = Some(frame);
                     force_key.store(true, Ordering::Relaxed);
                 }

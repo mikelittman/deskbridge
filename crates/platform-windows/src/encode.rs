@@ -283,15 +283,23 @@ impl Encoder {
                         if let Ok(bytes) = crate::codec::copy_sample_bytes(&sample) {
                             if !bytes.is_empty() {
                                 produced = Some((bytes, clean));
+                                // One HaveOutput event means one picture. Another ProcessOutput
+                                // returns E_UNEXPECTED and must not discard the picture we have.
+                                if self.events.is_some() {
+                                    break;
+                                }
                             }
                         }
                     }
                 }
                 Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT || err.code() == MF_E_NOTACCEPTING => break,
-                // An asynchronous encoder returns E_UNEXPECTED ("Catastrophic failure") when
-                // ProcessOutput runs before METransformHaveOutput. That means there is no picture yet.
-                Err(err) if err.code() == E_UNEXPECTED && self.events.is_some() && !self.output_expected => break,
-                Err(err) if err.code() == E_UNEXPECTED && produced.is_none() && !self.flipped_output => {
+                // E_UNEXPECTED ("Catastrophic failure") means there is no further picture.
+                // Keep a picture already read. If this was the first read and the encoder had
+                // asked us to collect output, try the other output-buffer mode once.
+                Err(err) if err.code() == E_UNEXPECTED => {
+                    if produced.is_some() || !self.output_expected || self.flipped_output {
+                        break;
+                    }
                     self.flipped_output = true;
                     self.provides_samples = !self.provides_samples;
                 }
