@@ -314,11 +314,15 @@ fn run(
                     force_key.store(true, Ordering::Relaxed);
                 }
                 None => {
-                    // The encoder accepted the frame and has not produced one yet.
-                    // Keep it, or the picture that is in flight is thrown away.
-                    preview_encoder = Some((preview, width, height));
-                    pending = Some(frame);
-                    force_key.store(true, Ordering::Relaxed);
+                    if preview.take_failed() {
+                        pending = Some(frame);
+                        force_key.store(true, Ordering::Relaxed);
+                    } else {
+                        // The encoder accepted the frame and has not produced one yet.
+                        preview_encoder = Some((preview, width, height));
+                        pending = Some(frame);
+                        force_key.store(true, Ordering::Relaxed);
+                    }
                 }
             }
         } else if encoder.is_none() && preview_encoder.is_none() && !encoder_failed {
@@ -331,6 +335,7 @@ fn run(
             }
         }
 
+        let mut reset_encoder = false;
         if preview_encoder.is_none() {
             if let Some(encoder) = encoder.as_mut() {
                 if pending.is_some() && !link_busy && (pace.due(now) || force_key.load(Ordering::Relaxed)) {
@@ -353,6 +358,9 @@ fn run(
                             pending = Some(frame);
                         }
                     }
+                    if encoder.take_failed() {
+                        reset_encoder = true;
+                    }
                 } else if pending.is_none() && !link_busy && !idle_encode_failed && force_key.load(Ordering::Relaxed) {
                     if let Some(frame) = latest.as_ref() {
                         let changed = frame.changed;
@@ -368,8 +376,16 @@ fn run(
                             }
                         }
                     }
+                    if encoder.take_failed() {
+                        reset_encoder = true;
+                    }
                 }
             }
+        }
+        if reset_encoder {
+            eprintln!("encoder stalled, opening it again");
+            encoder = None;
+            force_key.store(true, Ordering::Relaxed);
         }
         publish_cursor(&outbound, capture.geometry, &mut last_cursor);
         drain_audio(&outbound, &capture, &mut audio_encoder, &mut audio_broken);

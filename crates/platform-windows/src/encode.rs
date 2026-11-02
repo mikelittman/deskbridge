@@ -6,7 +6,7 @@ use windows::core::{Interface, VARIANT};
 use windows::Win32::Foundation::E_UNEXPECTED;
 use windows::Win32::Media::MediaFoundation::{
     IMFMediaEventGenerator, IMFSample, IMFTransform, MFSampleExtension_CleanPoint, MFVideoInterlace_Progressive,
-    METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_NOTACCEPTING,
+    MEError, METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_NOTACCEPTING,
     MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_SUBTYPE,
     MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MFT_CATEGORY_VIDEO_ENCODER, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
@@ -48,6 +48,11 @@ pub struct Encoder {
     held: Option<(Vec<u8>, bool)>,
     flipped_output: bool,
     output_expected: bool,
+    /// NeedInput events already taken. Each one must be answered with ProcessInput.
+    pending_need: u32,
+    produced_any: bool,
+    since_output: u32,
+    failed: bool,
     next_id: u64,
     parameter_sets: Vec<Vec<u8>>,
     _mf: MfGuard,
@@ -115,6 +120,10 @@ impl Encoder {
             held: None,
             flipped_output: false,
             output_expected: false,
+            pending_need: 0,
+            produced_any: false,
+            since_output: 0,
+            failed: false,
             next_id: 1,
             parameter_sets: Vec::new(),
             _mf: mf,
@@ -122,15 +131,9 @@ impl Encoder {
     }
 
     pub fn set_target_fps(&mut self, fps: u32) -> bool {
-        let fps = fps.clamp(1, 60);
-        if fps == self.fps {
-            return true;
-        }
-        self.fps = fps;
-        if let Ok(output) = unsafe { self.transform.GetOutputCurrentType(0) } {
-            let _ = unsafe { output.SetUINT64(&MF_MT_FRAME_RATE, pack_size(fps, 1)) };
-            let _ = unsafe { self.transform.SetOutputType(0, &output, 0) };
-        }
+        // The host decides how often to submit a frame. Changing the output media type
+        // while a hardware encoder is streaming makes it stop producing pictures.
+        self.fps = fps.clamp(1, 60);
         true
     }
 
@@ -139,21 +142,19 @@ impl Encoder {
         if bitrate == self.bitrate {
             return true;
         }
-        let mut applied = false;
-        if let Some(api) = &self.codec_api {
-            applied = set_codec_value(api, &CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate));
-        }
-        if let Ok(output) = unsafe { self.transform.GetOutputCurrentType(0) } {
-            if unsafe { output.SetUINT32(&MF_MT_AVG_BITRATE, bitrate) }.is_ok()
-                && unsafe { self.transform.SetOutputType(0, &output, 0) }.is_ok()
-            {
-                applied = true;
-            }
-        }
+        let applied = self.codec_api.as_ref().is_some_and(|api| {
+            set_codec_value(api, &CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bitrate))
+        });
         if applied {
             self.bitrate = bitrate;
         }
         applied
+    }
+
+    pub fn take_failed(&mut self) -> bool {
+        let failed = self.failed;
+        self.failed = false;
+        failed
     }
 
     pub fn encode(
@@ -193,12 +194,28 @@ impl Encoder {
             sample.SetSampleTime(when).ok();
             sample.SetSampleDuration(tick).ok();
         }
-        self.submit(&sample)?;
+        if self.events.is_some() {
+            self.pump(&sample)?;
+        } else {
+            self.submit_sync(&sample)?;
+        }
         let produced = if let Some(saved) = self.held.take() {
             Some(saved)
+        } else if self.events.is_some() {
+            None
         } else {
             self.drain_output()?
         };
+        if produced.is_some() {
+            self.since_output = 0;
+            self.produced_any = true;
+        } else if self.produced_any {
+            self.since_output = self.since_output.saturating_add(1);
+            if self.since_output > 45 {
+                self.failed = true;
+                return Err(PlatformError::new("encoder stopped producing frames"));
+            }
+        }
         let Some((bytes, clean)) = produced else {
             return Ok(None);
         };
@@ -325,11 +342,9 @@ impl Encoder {
         }
     }
 
-    fn submit(&mut self, sample: &IMFSample) -> Result<(), PlatformError> {
+    /// Synchronous encoders accept input immediately and say when they need more.
+    fn submit_sync(&mut self, sample: &IMFSample) -> Result<(), PlatformError> {
         for _ in 0..4 {
-            if self.events.is_some() {
-                self.wait_until_input_wanted();
-            }
             match unsafe { self.transform.ProcessInput(0, sample, 0) } {
                 Ok(()) => return Ok(()),
                 Err(err) if err.code() == MF_E_NOTACCEPTING => {
@@ -338,36 +353,66 @@ impl Encoder {
                 Err(err) => return Err(PlatformError::new(err)),
             }
         }
+        self.failed = true;
         Err(PlatformError::new(
             "encoder is not accepting frames. The hardware encoder did not ask for input.",
         ))
     }
 
-    fn wait_until_input_wanted(&mut self) {
+    /// An asynchronous encoder stalls if ProcessInput or ProcessOutput is called
+    /// except in answer to METransformNeedInput or METransformHaveOutput.
+    fn pump(&mut self, sample: &IMFSample) -> Result<(), PlatformError> {
         let Some(events) = self.events.clone() else {
-            return;
+            return Ok(());
         };
-        for _ in 0..40 {
+        let mut pending = Some(sample);
+        for _ in 0..60 {
             match unsafe { events.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
                 Ok(event) => {
                     let kind = unsafe { event.GetType() }.unwrap_or(0);
-                    if kind == METransformNeedInput.0 as u32 {
-                        return;
+                    if kind == MEError.0 as u32 {
+                        self.failed = true;
+                        return Err(PlatformError::new("encoder reported a failure"));
                     }
-                    if kind == METransformHaveOutput.0 as u32 && self.held.is_none() {
+                    if kind == METransformNeedInput.0 as u32 {
+                        if let Some(sample) = pending.take() {
+                            unsafe { self.transform.ProcessInput(0, sample, 0) }.map_err(|err| {
+                                self.failed = true;
+                                PlatformError::new(err)
+                            })?;
+                        } else {
+                            self.pending_need = self.pending_need.saturating_add(1);
+                        }
+                    } else if kind == METransformHaveOutput.0 as u32 {
                         self.output_expected = true;
-                        if let Ok(Some(packet)) = self.drain_output() {
+                        if let Some(packet) = self.drain_output()? {
                             self.held = Some(packet);
                         }
                         self.output_expected = false;
                     }
                 }
                 Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
+                    if pending.is_some() && self.pending_need > 0 {
+                        self.pending_need -= 1;
+                        let sample = pending.take().expect("pending frame");
+                        unsafe { self.transform.ProcessInput(0, sample, 0) }.map_err(|err| {
+                            self.failed = true;
+                            PlatformError::new(err)
+                        })?;
+                        continue;
+                    }
+                    if pending.is_none() {
+                        return Ok(());
+                    }
                     thread::sleep(Duration::from_millis(1));
                 }
-                Err(_) => return,
+                Err(err) => {
+                    self.failed = true;
+                    return Err(PlatformError::new(err));
+                }
             }
         }
+        Ok(())
     }
 }
 
