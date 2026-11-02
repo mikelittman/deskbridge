@@ -1,12 +1,12 @@
 {
-  "version": "0.0.8",
+  "version": "0.0.9",
   "description": "Small remote desktop",
   "homepage": "https://github.com/mikelittman/deskbridge",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/mikelittman/deskbridge/releases/download/v0.0.8/deskbridge-windows-x86_64.exe",
-      "hash": "33c4f363bfdaf2fba16412d20397117b61d917aa08d7baceb26fa730ee3e79a0"
+      "url": "https://github.com/mikelittman/deskbridge/releases/download/v0.0.9/deskbridge-windows-x86_64.exe",
+      "hash": "8afbb5fe64cf1badb45e9ca7195bb0123e9a0a03c8f3115ffa5e1e5c1ba838f4"
     }
   },
   "bin": [

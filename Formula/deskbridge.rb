@@ -1,13 +1,13 @@
 class Deskbridge < Formula
   desc "Small remote desktop"
   homepage "https://github.com/mikelittman/deskbridge"
-  version "0.0.8"
+  version "0.0.9"
   license "MIT"
   depends_on :macos
   depends_on arch: :arm64
 
-  url "https://github.com/mikelittman/deskbridge/releases/download/v0.0.8/deskbridge-macos-arm64"
-  sha256 "7dedf64f5b774082a537692ebbe5211069be5abc5101980299f3e51138b9557b"
+  url "https://github.com/mikelittman/deskbridge/releases/download/v0.0.9/deskbridge-macos-arm64"
+  sha256 "13de363a17ddda55dc3d3328e95d1010e3895c28d4cc99ebe2c355ad69bf646f"
 
   def install
     bin.install "deskbridge-macos-arm64" => "deskbridge"
