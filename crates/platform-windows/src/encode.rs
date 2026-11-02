@@ -3,6 +3,7 @@ use std::thread;
 use std::time::Duration;
 
 use windows::core::{Interface, VARIANT};
+use windows::Win32::Foundation::E_UNEXPECTED;
 use windows::Win32::Media::MediaFoundation::{
     IMFMediaEventGenerator, IMFSample, IMFTransform, MFSampleExtension_CleanPoint, MFVideoInterlace_Progressive,
     METransformHaveOutput, METransformNeedInput, MF_E_NO_EVENTS_AVAILABLE, MF_E_NOTACCEPTING,
@@ -45,6 +46,8 @@ pub struct Encoder {
     output_bytes: u32,
     events: Option<IMFMediaEventGenerator>,
     held: Option<(Vec<u8>, bool)>,
+    flipped_output: bool,
+    output_expected: bool,
     next_id: u64,
     parameter_sets: Vec<Vec<u8>>,
     _mf: MfGuard,
@@ -110,6 +113,8 @@ impl Encoder {
             output_bytes,
             events,
             held: None,
+            flipped_output: false,
+            output_expected: false,
             next_id: 1,
             parameter_sets: Vec::new(),
             _mf: mf,
@@ -283,15 +288,33 @@ impl Encoder {
                     }
                 }
                 Err(err) if err.code() == MF_E_TRANSFORM_NEED_MORE_INPUT || err.code() == MF_E_NOTACCEPTING => break,
+                // An asynchronous encoder returns E_UNEXPECTED ("Catastrophic failure") when
+                // ProcessOutput runs before METransformHaveOutput. That means there is no picture yet.
+                Err(err) if err.code() == E_UNEXPECTED && self.events.is_some() && !self.output_expected => break,
+                Err(err) if err.code() == E_UNEXPECTED && produced.is_none() && !self.flipped_output => {
+                    self.flipped_output = true;
+                    self.provides_samples = !self.provides_samples;
+                }
                 Err(err) if err.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                     if let Ok(next) = unsafe { self.transform.GetOutputAvailableType(0, 0) } {
                         unsafe { self.transform.SetOutputType(0, &next, 0).ok() };
                     }
+                    self.refresh_output_info();
                 }
                 Err(err) => return Err(PlatformError::new(err)),
             }
         }
         Ok(produced)
+    }
+
+    fn refresh_output_info(&mut self) {
+        let Ok(info) = (unsafe { self.transform.GetOutputStreamInfo(0) }) else {
+            return;
+        };
+        self.provides_samples = info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32) != 0;
+        if info.cbSize > 0 {
+            self.output_bytes = info.cbSize.max(256 * 1024).min(8 * 1024 * 1024);
+        }
     }
 
     fn submit(&mut self, sample: &IMFSample) -> Result<(), PlatformError> {
@@ -324,9 +347,11 @@ impl Encoder {
                         return;
                     }
                     if kind == METransformHaveOutput.0 as u32 && self.held.is_none() {
+                        self.output_expected = true;
                         if let Ok(Some(packet)) = self.drain_output() {
                             self.held = Some(packet);
                         }
+                        self.output_expected = false;
                     }
                 }
                 Err(err) if err.code() == MF_E_NO_EVENTS_AVAILABLE => {
